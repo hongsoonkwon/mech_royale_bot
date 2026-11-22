@@ -199,6 +199,26 @@ class WorldMap:
                     if blk[row + i]:
                         nb[nrow + i // f] = 1
             self.nblock = nb
+            # cover grid: walkable nav cells within ~8 m of a building (dilate blocked by 2 cells)
+            tmp = bytearray(self.nnx * self.nny)
+            for j in range(self.nny):
+                row = j * self.nnx
+                for i in range(self.nnx):
+                    if nb[row + i]:
+                        for di in (-2, -1, 0, 1, 2):
+                            ii = i + di
+                            if 0 <= ii < self.nnx:
+                                tmp[row + ii] = 1
+            cov = bytearray(self.nnx * self.nny)
+            for j in range(self.nny):
+                row = j * self.nnx
+                for i in range(self.nnx):
+                    if tmp[row + i]:
+                        for dj in (-2, -1, 0, 1, 2):
+                            jj = j + dj
+                            if 0 <= jj < self.nny:
+                                cov[jj * self.nnx + i] = 1
+            self.ncover = cov
             self.ok = True
             log("map loaded", self.gnx, self.gny)
         except Exception as e:
@@ -277,8 +297,10 @@ class WorldMap:
                 return False
         return True
 
-    def find_path(self, a, b, max_nodes=2500):
-        """A* on the 4 m grid. Returns world waypoints (partial path toward b if not reached)."""
+    def find_path(self, a, b, max_nodes=2500, cover_w=0.0, threats=None):
+        """A* on the 4 m grid. Returns world waypoints (partial path toward b if not reached).
+        cover_w > 0 makes open ground expensive (prefer routes with cover); threats add cost
+        within 70 m of known enemies (route around them)."""
         if not self.ok or getattr(self, "nblock", None) is None:
             return None
         R, nx, ny, nb = self.nres, self.nnx, self.nny, self.nblock
@@ -317,6 +339,26 @@ class WorldMap:
         best, besth = start, h(start)
         nodes = 0
         nbrs = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0), (1, 1, D2), (1, -1, D2), (-1, 1, D2), (-1, -1, D2))
+        opn = getattr(self, "ncover", None) if cover_w > 0 else None
+        tpts = [((tx - self.gx0) / R, (ty - self.gy0) / R) for (tx, ty, _) in (threats or [])]
+        trad = 70.0 / R
+        extra_cache = {}
+
+        def extra(c2):
+            v = extra_cache.get(c2)
+            if v is not None:
+                return v
+            v = 0.0
+            x2, y2 = c2 % nx, c2 // nx
+            if opn is not None and not opn[c2]:
+                v += cover_w  # open ground, no wall within ~8 m
+            for (px, py) in tpts:
+                dd = math.hypot(x2 - px, y2 - py)
+                if dd < trad:
+                    v += 2.0 * (1.0 - dd / trad)
+            extra_cache[c2] = v
+            return v
+
         while openh and nodes < max_nodes:
             f_, gc, c = heapq.heappop(openh)
             if gc > gcost.get(c, 1e18):
@@ -338,7 +380,7 @@ class WorldMap:
                     continue
                 if ddx and ddy and (nb[cy * nx + x2] or nb[y2 * nx + cx]):
                     continue  # no corner cutting
-                g2 = gc + w
+                g2 = gc + w * (1.0 + extra(c2)) if (opn is not None or tpts) else gc + w
                 if g2 < gcost.get(c2, 1e18):
                     gcost[c2] = g2
                     came[c2] = c
@@ -402,6 +444,7 @@ class Bot:
         self.seen_pickups = {}  # id -> (t, kind, x, y)
         self._pp = (-99.0, None, None)
         self._path, self._path_goal, self._path_t = None, None, -99.0
+        self._path_cover = False
         self._pp_prev = {}  # key -> (t, (x, y))  previous choice, for hysteresis
         self._zs = (-99.0, None)
         self._swap = {}  # pickup id -> slot to drop when taking it
@@ -550,6 +593,7 @@ class Bot:
         want = self.want_weapon(pos, my_kinds, weapons, zc, zr, t)
         hold_fire = False
         nav_dest = None
+        nav_cover = False
         recent_threats = [(x, y) for (et, x, y) in self.enemy_pos.values() if t - et < 15]
         if t > self.strafe_switch:
             self.strafe_dir = -self.strafe_dir
@@ -745,6 +789,7 @@ class Bot:
                 mode = "arm"
                 mvx, mvy = toward(arm_pt)
                 nav_dest = arm_pt
+                nav_cover = True
                 speed = 1.0
             elif nr > 4 and threats3 and self.can_hold(pos, threats3, zc, zr, nc, nr, d_center, shrink_end, t):
                 mode = "hold"  # safe here; let them gather and fight inside the circle
@@ -756,7 +801,9 @@ class Bot:
                     mode = "position"
                     mvx, mvy = toward(spot)
                     nav_dest = spot
+                    nav_cover = True
                     speed = 0.6 if (endgame and threats3) else 1.0
+                    boost = (not vis_enemies and energy > 60 and dist2(pos, spot) > 150)
             else:
                 mode = "hide"
                 ct = self.find_cover(pos, zc, zr, nc, nr, t)
@@ -800,7 +847,7 @@ class Bot:
         if zone_urgency >= 2.0:
             nav_dest = (zc[0], zc[1])  # outside the zone: getting back in comes first
         if nav_dest is not None and (mvx or mvy) and speed > 0:
-            nd = self.navigate(pos, nav_dest, t)
+            nd = self.navigate(pos, nav_dest, t, cover=nav_cover, threats=threats3)
             if nd is not None:
                 mvx, mvy = nd
 
@@ -925,16 +972,25 @@ class Bot:
                 best_s, best = s, (cx, cy)
         return best if best else (dx, dy)
 
-    def navigate(self, pos, dest, t):
-        """Direction toward dest around buildings, or None when the straight line is walkable."""
+    def navigate(self, pos, dest, t, cover=False, threats=None):
+        """Direction toward dest around buildings, or None when the straight line is fine.
+        cover=True: always route through covered ground and around known enemies."""
         m = self.map
-        if dest is None or not m.ok or m.path_clear(pos, dest):
+        if dest is None or not m.ok:
             self._path = None
             return None
+        if not cover and m.path_clear(pos, dest):
+            self._path = None
+            return None
+        if cover and dist2(pos, dest) < 12 and m.path_clear(pos, dest):
+            return None
         if (self._path is None or self._path_goal is None or dist2(self._path_goal, dest) > 10
-                or t - self._path_t > 3.0):
-            self._path = m.find_path(pos, dest) or []
-            self._path_goal, self._path_t = (dest[0], dest[1]), t
+                or t - self._path_t > 3.0 or self._path_cover != cover):
+            if cover:
+                self._path = m.find_path(pos, dest, max_nodes=4000, cover_w=1.5, threats=threats) or []
+            else:
+                self._path = m.find_path(pos, dest) or []
+            self._path_goal, self._path_t, self._path_cover = (dest[0], dest[1]), t, cover
         path = self._path
         while path and dist2(pos, path[0]) < 4.0:
             path.pop(0)
@@ -1115,10 +1171,11 @@ class Bot:
         cands = []
         if dist2(pos, nc) < R * 0.85:
             cands.append((pos[0], pos[1], 8.0))
-        for rf in (0.3, 0.55, 0.8):
+        for rf in (0.45, 0.7, 0.85):
             for k in range(16):
                 a = k * math.pi / 8 + rf
-                cands.append((nc[0] + R * rf * math.cos(a), nc[1] + R * rf * math.sin(a), 0.0))
+                # the rim of the next circle is the safest place to wait (one side is the zone)
+                cands.append((nc[0] + R * rf * math.cos(a), nc[1] + R * rf * math.sin(a), 8.0 if rf >= 0.7 else 0.0))
         if self._zs[1] is not None:
             cands.append((self._zs[1][0], self._zs[1][1], 12.0))
         best, bs = None, -1e18
@@ -1143,6 +1200,8 @@ class Bot:
 
     def can_hold(self, pos, threats, zc, zr, nc, nr, d_center, shrink_end, t):
         """Stay put: nobody we know of can see us, and the zone leaves time to walk in later."""
+        if dist2(pos, nc) > max(nr * 1.15, nr + 40.0):
+            return False  # far from where everyone must end up: move now, don't sit
         d_out = max(0.0, dist2(pos, nc) - nr * 0.8)
         if not ((shrink_end - t) > d_out / 8.0 + 10.0 and d_center < zr - 30):
             return False
