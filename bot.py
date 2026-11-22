@@ -199,7 +199,6 @@ class WorldMap:
                     if blk[row + i]:
                         nb[nrow + i // f] = 1
             self.nblock = nb
-            # cover grid: walkable nav cells within ~8 m of a building (dilate blocked by 2 cells)
             tmp = bytearray(self.nnx * self.nny)
             for j in range(self.nny):
                 row = j * self.nnx
@@ -299,8 +298,7 @@ class WorldMap:
 
     def find_path(self, a, b, max_nodes=2500, cover_w=0.0, threats=None):
         """A* on the 4 m grid. Returns world waypoints (partial path toward b if not reached).
-        cover_w > 0 makes open ground expensive (prefer routes with cover); threats add cost
-        within 70 m of known enemies (route around them)."""
+        cover_w > 0: open ground (no wall within ~8 m) costs more; threats: cost within 70 m of enemies."""
         if not self.ok or getattr(self, "nblock", None) is None:
             return None
         R, nx, ny, nb = self.nres, self.nnx, self.nny, self.nblock
@@ -351,9 +349,9 @@ class WorldMap:
             v = 0.0
             x2, y2 = c2 % nx, c2 // nx
             if opn is not None and not opn[c2]:
-                v += cover_w  # open ground, no wall within ~8 m
-            for (px, py) in tpts:
-                dd = math.hypot(x2 - px, y2 - py)
+                v += cover_w
+            for (qx, qy) in tpts:
+                dd = math.hypot(x2 - qx, y2 - qy)
                 if dd < trad:
                     v += 2.0 * (1.0 - dd / trad)
             extra_cache[c2] = v
@@ -445,11 +443,11 @@ class Bot:
         self._pp = (-99.0, None, None)
         self._path, self._path_goal, self._path_t = None, None, -99.0
         self._path_cover = False
+        self._prog = None  # (dest, best_dist, t_best) progress toward the current destination
+        self._bad_spots = []  # (t, x, y) destinations we could not reach
         self._pp_prev = {}  # key -> (t, (x, y))  previous choice, for hysteresis
         self._zs = (-99.0, None)
         self._swap = {}  # pickup id -> slot to drop when taking it
-        self.commit_id, self.commit_until = None, -99.0
-        self.heard = []  # (t, x, y, danger) estimated from sounds
 
     # ------------------------------------------------------------------
     def act(self, o):
@@ -470,8 +468,6 @@ class Bot:
         hp_frac = hp / max_hp
 
         action = {"tick": o.get("tick")}
-        self.last_ratio = None
-        self._me = pos
         self.shoot_obj = None
         self.shoot_kind = None
 
@@ -576,14 +572,6 @@ class Bot:
                                             m.get("hp", 1400) / max(1, m.get("max_hp", 1400)))
         for pk in o.get("pickups", []) or []:
             self.seen_pickups[pk.get("id")] = (t, pk.get("kind"), pk["pos"][0], pk["pos"][1])
-        for snd in o.get("sounds", []) or []:
-            k, b = snd.get("kind"), snd.get("bearing")
-            dg = self.SOUND_DANGER.get(k)
-            if dg is None or b is None:
-                continue
-            r = {"near": 40.0, "mid": 110.0, "far": 220.0}.get(snd.get("dist"), 110.0)
-            self.heard.append((t, pos[0] + r * math.cos(b), pos[1] + r * math.sin(b), dg))
-        self.heard = [h for h in self.heard if t - h[0] < 10.0][-30:]
         for ev in o.get("events", []) or []:
             if ev.get("type") == "took":
                 self.seen_pickups.pop(ev.get("id"), None)
@@ -592,8 +580,6 @@ class Bot:
         threats3 = self.threat_list(pos, t)
         want = self.want_weapon(pos, my_kinds, weapons, zc, zr, t)
         hold_fire = False
-        tdirs = self.threat_dirs(pos, t)
-        surr = self.surrounded(tdirs)
         nav_dest = None
         nav_cover = False
         recent_threats = [(x, y) for (et, x, y) in self.enemy_pos.values() if t - et < 15]
@@ -614,7 +600,7 @@ class Bot:
             gd = dist2(pos, gp)
             gone = gid not in ids and gd < (12 if gk == "pickup" else 40)
             took = any(ev.get("type") == "took" for ev in o.get("events", []) or [])
-            if t - gt > 25 or gone or took or dist2(gp, zc) > zr - 10 or (dist2(pos, gp) > 15 and self.danger_near(gp, t)):
+            if t - gt > 25 or gone or took or dist2(gp, zc) > zr - 10:
                 self.goal = g = None
         # accept some damage to finish a worthwhile errand when nobody is close
         goal_lock = (g is not None and hp_frac > 0.5 and zone_urgency < 1.5
@@ -636,41 +622,10 @@ class Bot:
             their_frac = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
             outmatched = (n_threat >= 2 or (hp_frac < 0.4 and their_frac > hp_frac + 0.1)) and not endgame
             outgunned = "laser" in (target.get("weapons") or []) and not has_laser and d > 60 and not endgame
-            ratio = self.matchup(hp, my_kinds, me.get("cubes", 0) or 0, target, vis_enemies)
-            self.last_ratio = ratio
-            tid = target.get("id")
-            attacked_by_it = recently_hit and self.last_hit_by == tid
-            committed = self.commit_id == tid and t < self.commit_until
-            breakout = False
-            if surr and ratio >= 1.0 and not endgame:
-                tb = math.atan2(target["pos"][1] - pos[1], target["pos"][0] - pos[0])
-                best_dir = min(self.dir_threat(tdirs, k * math.pi / 6) for k in range(12))
-                # its own weight sits in its direction; compare the rest
-                rest = self.dir_threat([x for x in tdirs if abs(wrap(x[0] - tb)) > 0.2 or abs(x[1] - d) > 15], tb)
-                breakout = rest <= best_dir + 0.3
-            withdraw = (not attacked_by_it and not committed and ratio < 1.2
-                        and d >= 25 and not endgame and zone_urgency < 2.0 and not breakout)
-            if not withdraw:
-                self.commit_id, self.commit_until = tid, t + 5.0
-            if withdraw:
-                # it hasn't started on us and we wouldn't clearly win: back off out of its sight
-                mode = "withdraw"
-                dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="withdraw", tdirs=tdirs)
-                if dest is not None and dist2(pos, dest) > 3:
-                    mvx, mvy = toward(dest)
-                    nav_dest = dest
-                    speed = 1.0
-                hold_fire = True
-            elif breakout:
-                # boxed in: punch out through the weakest side instead of waiting to be pinched
-                mode = "breakout"
-                mvx, mvy = toward(target["pos"], 0.7) if d > 60 else (px, py)
-                nav_dest = (target["pos"][0], target["pos"][1]) if d > 60 else None
-                speed = 1.0
-            elif outgunned:
+            if outgunned:
                 # a laser out-trades our gun at range: break line of sight, go arm up, come back
                 mode = "escape"
-                dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="escape", tdirs=tdirs)
+                dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="escape")
                 mvx, mvy = toward(dest, 0.2) if dest is not None else (-ex, -ey)
                 nav_dest = dest
                 speed = 1.0
@@ -683,7 +638,7 @@ class Bot:
                 speed = 1.0
             elif outmatched:
                 mode = "retreat"
-                dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="retreat", tdirs=tdirs)
+                dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="retreat")
                 nav_dest = dest
                 if dest is not None:
                     mvx, mvy = toward(dest, 0.3)
@@ -699,9 +654,7 @@ class Bot:
                 speed = 0.7
             else:
                 back = 0.0
-                if "lightning" in (target.get("weapons") or []) and "lightning" not in my_kinds and d < 52:
-                    back = -1.0  # its arc reaches 45 m: stay outside it
-                elif d < 35:
+                if d < 35:
                     back = -0.8
                 elif d > 140:
                     back = 0.3
@@ -726,7 +679,7 @@ class Bot:
             else:
                 mode = "evade"
                 th = threats3 or [(pos[0] + ex * 80, pos[1] + ey * 80, 1.5)]
-                dest = self.pick_position(pos, th, zc, zr, nc, nr, t, want=want, key="evade", tdirs=tdirs)
+                dest = self.pick_position(pos, th, zc, zr, nc, nr, t, want=want, key="evade")
                 nav_dest = dest
                 if dest is not None:
                     mvx, mvy = toward(dest, 0.4)
@@ -742,7 +695,7 @@ class Bot:
             th = list(threats3)
             if not th and self.last_hit_bearing is not None:
                 th = [(pos[0] + 80 * math.cos(self.last_hit_bearing), pos[1] + 80 * math.sin(self.last_hit_bearing), 1.5)]
-            dest = self.pick_position(pos, th, zc, zr, nc, nr, t, want=want, key="relocate", tdirs=tdirs) if th else None
+            dest = self.pick_position(pos, th, zc, zr, nc, nr, t, want=want, key="relocate") if th else None
             if dest is not None and dist2(pos, dest) > 4:
                 mode = "relocate"
                 mvx, mvy = toward(dest)
@@ -750,21 +703,12 @@ class Bot:
                 speed = 1.0
             else:
                 self.reloc_done = True
-        recovering = (hp_frac < 0.7 and t - self.last_combat_t < 40 and zone_urgency < 1.0 and not endgame)
-        if mode == "idle" and not fighting and not evading and recovering:
-            mode = "recover"
-            ct = self.pick_position(pos, threats3, zc, zr, nc, nr, t, key="recover", tdirs=tdirs)
-            if ct is not None and dist2(pos, ct) > 4:
-                mvx, mvy = toward(ct)
-                nav_dest = ct
-                nav_cover = True
-                speed = 1.0
         if mode == "idle" and not fighting and not evading and zone_urgency < 1.5:
             prey = self.pick_prey(pos, t, hp_frac, has_laser, my_kinds)
             if prey is not None:
                 mode = "hunt"
                 others = [th for th in threats3 if dist2(th, prey) > 5]
-                dest = self.pick_position(pos, others, zc, zr, nc, nr, t, hunt=prey, key="hunt", tdirs=tdirs)
+                dest = self.pick_position(pos, others, zc, zr, nc, nr, t, hunt=prey, key="hunt")
                 if dest is not None:
                     mvx, mvy = toward(dest)
                     nav_dest = dest
@@ -807,19 +751,9 @@ class Bot:
                 nav_dest = (zc[0], zc[1])
                 speed = 1.0
                 boost = energy > 20
-            elif not vis_enemies and (nr <= 140 or o.get("alive", 16) <= 6) and (arm_pt := self.arm_target(pos, my_kinds, weapons, threats3, zc, zr, nc, nr, shrink_end, t,
-                                                                nr <= 70 or o.get("alive", 16) <= 4)) is not None:
-                # quiet moment: go get a better weapon before the fight that's coming
-                mode = "arm"
-                mvx, mvy = toward(arm_pt)
-                nav_dest = arm_pt
-                nav_cover = True
-                speed = 1.0
-            elif nr > 4 and threats3 and self.can_hold(pos, threats3, zc, zr, nc, nr, d_center, shrink_end, t):
-                mode = "hold"  # safe here; let them gather and fight inside the circle
             elif nr > 4:
                 # take good ground inside the next circle early, away from known enemies
-                spot = self.pick_zone_spot(pos, threats3, zc, zr, nc, nr, t, tdirs=tdirs)
+                spot = self.pick_zone_spot(pos, threats3, zc, zr, nc, nr, t)
                 mode = "hide"
                 if spot is not None and dist2(pos, spot) > 4:
                     mode = "position"
@@ -859,17 +793,32 @@ class Bot:
                 w = (60 - d) / 60
                 rx += ux * w
                 ry += uy * w
-        if mode in ("hide", "zone", "loot", "relocate", "hunt", "position", "arm", "recover") and (rx or ry):
+        if mode in ("hide", "zone", "loot", "relocate", "hunt", "position") and (rx or ry):
             mvx += rx
             mvy += ry
             if speed < 0.38:
                 speed = 0.38
-        elif mode in ("fight", "retreat", "evade", "loot_fight", "escape", "push", "withdraw", "breakout"):
+        elif mode in ("fight", "retreat", "evade", "loot_fight", "escape", "push"):
             mvx += rx * 0.5
             mvy += ry * 0.5
 
         if zone_urgency >= 2.0:
             nav_dest = (zc[0], zc[1])  # outside the zone: getting back in comes first
+        if nav_dest is not None:
+            dd_ = dist2(pos, nav_dest)
+            pr = self._prog
+            if pr is None or dist2(pr[0], nav_dest) > 10:
+                self._prog = (nav_dest, dd_, t)
+            elif dd_ < pr[1] - 2.0:
+                self._prog = (pr[0], dd_, t)
+            elif t - pr[2] > 3.0 and dd_ > 6:
+                # no progress for 3 s: this spot is unreachable from here; pick another
+                self._bad_spots.append((t, nav_dest[0], nav_dest[1]))
+                self._bad_spots = [b_ for b_ in self._bad_spots if t - b_[0] < 30][-12:]
+                self._zs = (-99.0, None)
+                self._pp = (-99.0, None, None)
+                self._path = None
+                self._prog = None
         if nav_dest is not None and (mvx or mvy) and speed > 0:
             nd = self.navigate(pos, nav_dest, t, cover=nav_cover, threats=threats3)
             if nd is not None:
@@ -998,7 +947,7 @@ class Bot:
 
     def navigate(self, pos, dest, t, cover=False, threats=None):
         """Direction toward dest around buildings, or None when the straight line is fine.
-        cover=True: always route through covered ground and around known enemies."""
+        cover=True: route along building walls and around known enemies."""
         m = self.map
         if dest is None or not m.ok:
             self._path = None
@@ -1029,8 +978,6 @@ class Bot:
         return norm2(wp[0] - pos[0], wp[1] - pos[1])
 
     DANGER = {"laser": 2.0, "mortar": 1.5, "lightning": 1.2}
-    SOUND_DANGER = {"gun": 1.0, "laser": 2.0, "laser_charge": 2.0, "mortar": 1.5, "explosion": 1.0,
-                    "lightning": 1.2, "step": 1.0, "boost": 1.0, "jet": 1.0, "reload": 1.0}
 
     def threat_list(self, pos, t):
         """Up to 3 known enemies (seen in the last 15 s) as (x, y, danger), most dangerous first."""
@@ -1041,13 +988,6 @@ class Bot:
             dg = max([1.0] + [self.DANGER.get(k, 1.0) for k in wl]) * (0.6 + 0.4 * hpf)
             d = dist2(pos, (x, y))
             out.append((dg * 200.0 / max(40.0, d), (x, y, dg)))
-        seen = [v[1] for v in out]
-        for (ht, x, y, dg) in self.heard:
-            if any(dist2((x, y), (sx, sy)) < 40 for (sx, sy, _) in seen):
-                continue  # already tracked by sight
-            d = dist2(pos, (x, y))
-            out.append((0.7 * dg * 200.0 / max(40.0, d), (x, y, 0.7 * dg)))
-            seen.append((x, y, dg))
         out.sort(key=lambda v: -v[0])
         return [v[1] for v in out[:5]]
 
@@ -1058,7 +998,7 @@ class Bot:
         cur_val = min([self.weapon_value(k, t) for k in specials], default=0.0)
         best, bs = None, -1e9
         for i, (pt, k, x, y) in list(self.seen_pickups.items()):
-            if t - pt > 240:
+            if t - pt > 90:
                 del self.seen_pickups[i]
                 continue
             v = self.weapon_value(k, t)
@@ -1070,43 +1010,6 @@ class Bot:
             if d > 180:
                 continue
             sc = (v - (cur_val if full else 0.0)) * 30 - d * 0.5
-            if sc > bs:
-                bs, best = sc, (x, y)
-        return best
-
-    def arm_target(self, pos, my_kinds, weapons, threats, zc, zr, nc, nr, shrink_end, t, late):
-        """A remembered weapon worth a detour while it's quiet: clearly better than what we'd drop,
-        reachable before the zone closes, and not watched by a known laser/mortar."""
-        full = not any(w is None for w in weapons[:2]) and len([w for w in weapons if w]) >= 2
-        specials = [w.get("kind") for w in weapons[:2] if w and w.get("kind") != "gun"]
-        cur_val = min([self.weapon_value(k, t) for k in specials], default=0.0)
-        need = (0.5 if late else 0.8) if full else 0.0
-        m = self.map
-        best, bs = None, -1e9
-        for i, (pt, k, x, y) in self.seen_pickups.items():
-            if t - pt > 240 or k in my_kinds or self.danger_near((x, y), t):
-                continue
-            v = self.weapon_value(k, t)
-            gain = v - (cur_val if full else 0.0)
-            if v <= 0 or gain < need:
-                continue
-            d = dist2(pos, (x, y))
-            if d > 250 or dist2((x, y), zc) > zr - 20:
-                continue
-            if (shrink_end - t) < (d + max(0.0, dist2((x, y), nc) - nr * 0.8)) / 8.0 + 8.0:
-                continue  # no time to get it and still make the circle
-            exposed = False
-            mx, my = (pos[0] + x) * 0.5, (pos[1] + y) * 0.5
-            for (tx, ty, dg) in threats[:3]:
-                if dg < 1.4 or dist2((tx, ty), (x, y)) > 220:
-                    continue
-                eye = (tx, ty, m.ground(tx, ty) + 8.0)
-                if m.los(eye, (x, y, m.ground(x, y) + 4.5), 4.0) or m.los(eye, (mx, my, m.ground(mx, my) + 4.5), 4.0):
-                    exposed = True
-                    break
-            if exposed:
-                continue
-            sc = gain * 40 - d * 0.4
             if sc > bs:
                 bs, best = sc, (x, y)
         return best
@@ -1132,7 +1035,7 @@ class Bot:
                 bd, best = d, (x, y)
         return best
 
-    def pick_position(self, pos, threats, zc, zr, nc, nr, t, want=None, hunt=None, key="", tdirs=None):
+    def pick_position(self, pos, threats, zc, zr, nc, nr, t, want=None, hunt=None, key=""):
         """Score nearby spots: out of known enemies' sight (lasers count double), far from them,
         enclosed rather than open, reachable without crossing their sightlines; optionally
         toward a weapon we want or to ~70 m from a prey. Cached 1 s per purpose."""
@@ -1152,7 +1055,10 @@ class Bot:
         prev = self._pp_prev.get(key)
         if prev is not None and t - prev[0] < 4.0:
             cands.append((prev[1][0], prev[1][1], -1.0))
+        bad = [(bx, by) for (bt, bx, by) in self._bad_spots if t - bt < 30]
         for (x, y, r) in cands:
+            if bad and any(dist2((x, y), b_) < 15 for b_ in bad):
+                continue
             stick = 12.0 if r < 0 else 0.0
             r = dist2(pos, (x, y)) if r < 0 else r
             if r > 0 and m.blocked(x, y):
@@ -1161,8 +1067,6 @@ class Bot:
                 continue
             gz = m.ground(x, y)
             sc = stick - 0.25 * r - 40.0 * m.openness(x, y)
-            if tdirs and r > 3:
-                sc -= 20.0 * self.dir_threat(tdirs, math.atan2(y - pos[1], x - pos[0]))
             mx, my = (pos[0] + x) * 0.5, (pos[1] + y) * 0.5
             for ti, (tx, ty, dg) in enumerate(threats):
                 d = dist2((x, y), (tx, ty))
@@ -1184,7 +1088,7 @@ class Bot:
             self._pp_prev[key] = (t, best)
         return best
 
-    def pick_zone_spot(self, pos, threats, zc, zr, nc, nr, t, tdirs=None):
+    def pick_zone_spot(self, pos, threats, zc, zr, nc, nr, t):
         """Where to wait for the next circle: inside it (and the current one), enclosed, near a
         wall, out of known enemies' sight and far from them, not too far to walk. Cached 2 s,
         and the previous spot is kept unless something is clearly better."""
@@ -1195,23 +1099,26 @@ class Bot:
             return None
         R = max(nr, 8.0)
         cands = []
-        if dist2(pos, nc) < R * 0.85:
-            cands.append((pos[0], pos[1], 8.0))
-        for rf in (0.45, 0.7, 0.85):
-            for k in range(16):
-                a = k * math.pi / 8 + rf
-                # the rim of the next circle is the safest place to wait (one side is the zone)
-                cands.append((nc[0] + R * rf * math.cos(a), nc[1] + R * rf * math.sin(a), 8.0 if rf >= 0.7 else 0.0))
+        dn = dist2(pos, nc)
+        if R * 0.6 <= dn < R * 0.92:
+            cands.append((pos[0], pos[1], 8.0))  # already on the rim band: stay unless clearly worse
+        # rim band of the next circle near our own angle: orbit along it, never cut through the middle
+        me_a = math.atan2(pos[1] - nc[1], pos[0] - nc[0])
+        for k in range(-8, 9):
+            a = me_a + k * (math.pi / 18) * 1.1
+            for rf in (0.72, 0.85):
+                cands.append((nc[0] + R * rf * math.cos(a), nc[1] + R * rf * math.sin(a), 0.0))
         if self._zs[1] is not None:
             cands.append((self._zs[1][0], self._zs[1][1], 12.0))
         best, bs = None, -1e18
+        bad = [(bx, by) for (bt, bx, by) in self._bad_spots if t - bt < 30]
         for (x, y, bonus) in cands:
             if m.blocked(x, y) or dist2((x, y), zc) > zr - 15 or dist2((x, y), nc) > R * 0.9:
                 continue
+            if any(dist2((x, y), b_) < 15 for b_ in bad):
+                continue
             gz = m.ground(x, y)
             sc = bonus - 40.0 * m.openness(x, y) - 0.12 * dist2(pos, (x, y))
-            if tdirs and dist2(pos, (x, y)) > 3:
-                sc -= 20.0 * self.dir_threat(tdirs, math.atan2(y - pos[1], x - pos[0]))
             if m.near_wall(x, y, 6.0):
                 sc += 15.0
             for ti, (tx, ty, dg) in enumerate(threats):
@@ -1226,116 +1133,17 @@ class Bot:
 
     BEATS = {"laser": "mortar", "mortar": "lightning", "lightning": "laser"}
 
-    def danger_near(self, pt, t):
-        """An enemy was seen within 90 m of pt in the last 30 s, or heard within 70 m in the last 10 s."""
-        for (et, x, y, wl, hpf) in self.enemy_info.values():
-            if t - et < 30 and dist2(pt, (x, y)) < 90:
-                return True
-        for (ht, x, y, dg) in self.heard:
-            if t - ht < 10 and dist2(pt, (x, y)) < 70:
-                return True
-        return False
-
-    def threat_dirs(self, pos, t):
-        """Known (seen <= 20 s) and heard enemies within 300 m as (bearing, distance, danger)."""
-        pts = []
-        for i, (et, x, y, wl, hpf) in self.enemy_info.items():
-            if t - et > 20:
-                continue
-            dg = max([1.0] + [self.DANGER.get(k, 1.0) for k in wl]) * (0.6 + 0.4 * hpf)
-            pts.append((x, y, dg))
-        for (ht, x, y, dg) in self.heard:
-            if any(dist2((x, y), (q[0], q[1])) < 40 for q in pts):
-                continue
-            pts.append((x, y, 0.7 * dg))
-        out = []
-        for (x, y, dg) in pts:
-            d = dist2(pos, (x, y))
-            if d <= 300:
-                out.append((math.atan2(y - pos[1], x - pos[0]), d, dg))
-        return out
-
-    @staticmethod
-    def dir_threat(tdirs, ang):
-        """How much trouble lies in direction ang (danger x closeness, cos^2 falloff over +-90 deg)."""
-        s_ = 0.0
-        for (a, d, dg) in tdirs:
-            c = math.cos(wrap(a - ang))
-            if c > 0:
-                s_ += dg * c * c * (100.0 / max(40.0, d))
-        return s_
-
-    @staticmethod
-    def surrounded(tdirs):
-        near = [(a, d) for (a, d, dg) in tdirs if d < 250]
-        quads = set(int((a + math.pi) / (math.pi / 2)) % 4 for (a, d) in near)
-        return len(quads) >= 3 or len(near) >= 4
-
-    def can_hold(self, pos, threats, zc, zr, nc, nr, d_center, shrink_end, t):
-        """Stay put: nobody we know of can see us, and the zone leaves time to walk in later."""
-        if dist2(pos, nc) > max(nr * 1.15, nr + 40.0):
-            return False  # far from where everyone must end up: move now, don't sit
-        d_out = max(0.0, dist2(pos, nc) - nr * 0.8)
-        if not ((shrink_end - t) > d_out / 8.0 + 10.0 and d_center < zr - 30):
-            return False
-        m = self.map
-        gz = pos[2] + 4.5
-        for (tx, ty, dg) in threats[:3]:
-            if dist2(pos, (tx, ty)) < 230 and m.los((tx, ty, m.ground(tx, ty) + 8.0), (pos[0], pos[1], gz), 4.0):
-                return False
-        return True
-
-    def wpow(self, kinds, d, foe_kinds):
-        """Rough damage-per-second power of a loadout at distance d (best weapon + a bit of the second)."""
-        vals = []
-        for k in kinds or ["gun"]:
-            if k == "gun":
-                v = max(0.0, 1.0 - d / 400.0) if d < 230 else 0.0
-            elif k == "laser":
-                v = 1.3 if d < 280 else 0.0
-            elif k == "mortar":
-                v = 0.8 if 30 < d < 225 else (0.3 if d <= 30 else 0.0)
-            elif k == "lightning":
-                v = 1.6 if d < 45 else 0.0
-            else:
-                v = 0.0
-            if v and self.BEATS.get(k) in (foe_kinds or []):
-                v *= 1.3
-            vals.append(v)
-        vals.sort(reverse=True)
-        return (vals[0] if vals else 0.0) + 0.3 * (vals[1] if len(vals) > 1 else 0.0) + 0.05
-
-    def matchup(self, hp, my_kinds, my_cubes, target, enemies):
-        """> 1: we should win the trade; < 1: we die first. Lanchester-style hp x dps."""
-        d = target["_d"]
-        tk = target.get("weapons") or ["gun"]
-        ours = self.wpow(my_kinds, d, tk) * (1 + 0.04 * min(10, my_cubes))
-        their_hp = float(target.get("hp", 1400) or 1400)
-        their_dps = 0.0
-        for m in enemies:
-            if m is target or (m.get("_los") and m["_d"] < 230):
-                mk = m.get("weapons") or ["gun"]
-                their_dps += self.wpow(mk, m["_d"], my_kinds) * (1 + 0.04 * min(10, m.get("cubes", 0) or 0))
-                if m is not target:
-                    their_hp += 0.5 * float(m.get("hp", 1400) or 1400)
-        return (hp * ours) / max(1.0, their_hp * their_dps)
-
     def weapon_value(self, k, t):
         """Base worth of a weapon, adjusted by what the enemies we've seen carry (triangle)."""
         base = {"laser": 3.0, "mortar": 2.5, "lightning": 2.0}.get(k, 0.0)
         if base <= 0:
             return 0.0
-        me = getattr(self, "_me", None)
-        lists = []
-        for v in self.enemy_info.values():
-            if t - v[0] < 120:
-                w = 1.0 / (1.0 + dist2(me, (v[1], v[2])) / 150.0) if me is not None else 1.0
-                lists.append((w, v[3]))
+        lists = [v[3] for v in self.enemy_info.values() if t - v[0] < 120]
         if not lists:
             return base
-        n = sum(w for w, _ in lists)
-        good = sum(w for w, wl in lists if self.BEATS[k] in wl) / n
-        bad = sum(w for w, wl in lists if any(self.BEATS.get(x) == k for x in wl)) / n
+        n = float(len(lists))
+        good = sum(1 for wl in lists if self.BEATS[k] in wl) / n
+        bad = sum(1 for wl in lists if any(self.BEATS.get(x) == k for x in wl)) / n
         return base + 1.5 * good - 1.5 * bad
 
     def pick_relocate(self, pos, threats, zc, zr, t):
@@ -1421,7 +1229,7 @@ class Bot:
             for p in o.get("pickups", []) or []:
                 k = p.get("kind")
                 v = self.weapon_value(k, t)
-                if k in kinds or v <= 0 or self.danger_near(p["pos"], t):
+                if k in kinds or v <= 0:
                     continue
                 if not empty:
                     if drop_slot is None or v < cur_val + 0.8:
@@ -1437,7 +1245,7 @@ class Bot:
                     bscore, best = s, ("pickup", p)
         for c in o.get("cubes", []) or []:
             d = dist2(pos, c["pos"])
-            if d > 45 or abs(c["pos"][2] - pos[2]) > 10 or (d > 12 and self.danger_near(c["pos"], t)):
+            if d > 45 or abs(c["pos"][2] - pos[2]) > 10:
                 continue
             if dist2(c["pos"], zc) > zr - 15:
                 continue
@@ -1448,7 +1256,7 @@ class Bot:
             # crates: 1 cube + maybe a weapon
             for c in o.get("crates", []) or []:
                 d = dist2(pos, c["pos"])
-                if d > 90 or abs(c["pos"][2] - pos[2]) > 4 or dist2(c["pos"], zc) > zr - 15 or self.danger_near(c["pos"], t):
+                if d > 90 or abs(c["pos"][2] - pos[2]) > 4 or dist2(c["pos"], zc) > zr - 15:
                     continue
                 s = 25 - d * 0.5
                 if s > bscore:
@@ -1457,7 +1265,7 @@ class Bot:
             if early:
                 for n_ in npcs:
                     d = dist2(pos, n_["pos"])
-                    if d > 90 or dist2(n_["pos"], zc) > zr - 15 or self.danger_near(n_["pos"], t):
+                    if d > 90 or dist2(n_["pos"], zc) > zr - 15:
                         continue
                     s = 22 - d * 0.5
                     if s > bscore:
