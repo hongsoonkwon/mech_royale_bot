@@ -357,7 +357,10 @@ class WorldMap:
             extra_cache[c2] = v
             return v
 
+        t_end = time.perf_counter() + 0.004  # hard time budget: a partial path is fine, a late answer is not
         while openh and nodes < max_nodes:
+            if (nodes & 63) == 0 and nodes and time.perf_counter() > t_end:
+                break
             f_, gc, c = heapq.heappop(openh)
             if gc > gcost.get(c, 1e18):
                 continue
