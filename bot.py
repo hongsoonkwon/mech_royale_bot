@@ -428,6 +428,7 @@ class Bot:
 
         action = {"tick": o.get("tick")}
         self.last_ratio = None
+        self._me = pos
         self.shoot_obj = None
         self.shoot_kind = None
 
@@ -639,7 +640,9 @@ class Bot:
                 speed = 0.7
             else:
                 back = 0.0
-                if d < 35:
+                if "lightning" in (target.get("weapons") or []) and "lightning" not in my_kinds and d < 52:
+                    back = -1.0  # its arc reaches 45 m: stay outside it
+                elif d < 35:
                     back = -0.8
                 elif d > 140:
                     back = 0.3
@@ -736,6 +739,13 @@ class Bot:
                 nav_dest = (zc[0], zc[1])
                 speed = 1.0
                 boost = energy > 20
+            elif not vis_enemies and (nr <= 140 or o.get("alive", 16) <= 6) and (arm_pt := self.arm_target(pos, my_kinds, weapons, threats3, zc, zr, nc, nr, shrink_end, t,
+                                                                nr <= 70 or o.get("alive", 16) <= 4)) is not None:
+                # quiet moment: go get a better weapon before the fight that's coming
+                mode = "arm"
+                mvx, mvy = toward(arm_pt)
+                nav_dest = arm_pt
+                speed = 1.0
             elif nr > 4 and threats3 and self.can_hold(pos, threats3, zc, zr, nc, nr, d_center, shrink_end, t):
                 mode = "hold"  # safe here; let them gather and fight inside the circle
             elif nr > 4:
@@ -778,7 +788,7 @@ class Bot:
                 w = (60 - d) / 60
                 rx += ux * w
                 ry += uy * w
-        if mode in ("hide", "zone", "loot", "relocate", "hunt", "position") and (rx or ry):
+        if mode in ("hide", "zone", "loot", "relocate", "hunt", "position", "arm") and (rx or ry):
             mvx += rx
             mvy += ry
             if speed < 0.38:
@@ -968,7 +978,7 @@ class Bot:
         cur_val = min([self.weapon_value(k, t) for k in specials], default=0.0)
         best, bs = None, -1e9
         for i, (pt, k, x, y) in list(self.seen_pickups.items()):
-            if t - pt > 90:
+            if t - pt > 240:
                 del self.seen_pickups[i]
                 continue
             v = self.weapon_value(k, t)
@@ -980,6 +990,43 @@ class Bot:
             if d > 180:
                 continue
             sc = (v - (cur_val if full else 0.0)) * 30 - d * 0.5
+            if sc > bs:
+                bs, best = sc, (x, y)
+        return best
+
+    def arm_target(self, pos, my_kinds, weapons, threats, zc, zr, nc, nr, shrink_end, t, late):
+        """A remembered weapon worth a detour while it's quiet: clearly better than what we'd drop,
+        reachable before the zone closes, and not watched by a known laser/mortar."""
+        full = not any(w is None for w in weapons[:2]) and len([w for w in weapons if w]) >= 2
+        specials = [w.get("kind") for w in weapons[:2] if w and w.get("kind") != "gun"]
+        cur_val = min([self.weapon_value(k, t) for k in specials], default=0.0)
+        need = (0.5 if late else 0.8) if full else 0.0
+        m = self.map
+        best, bs = None, -1e9
+        for i, (pt, k, x, y) in self.seen_pickups.items():
+            if t - pt > 240 or k in my_kinds:
+                continue
+            v = self.weapon_value(k, t)
+            gain = v - (cur_val if full else 0.0)
+            if v <= 0 or gain < need:
+                continue
+            d = dist2(pos, (x, y))
+            if d > 250 or dist2((x, y), zc) > zr - 20:
+                continue
+            if (shrink_end - t) < (d + max(0.0, dist2((x, y), nc) - nr * 0.8)) / 8.0 + 8.0:
+                continue  # no time to get it and still make the circle
+            exposed = False
+            mx, my = (pos[0] + x) * 0.5, (pos[1] + y) * 0.5
+            for (tx, ty, dg) in threats[:3]:
+                if dg < 1.4 or dist2((tx, ty), (x, y)) > 220:
+                    continue
+                eye = (tx, ty, m.ground(tx, ty) + 8.0)
+                if m.los(eye, (x, y, m.ground(x, y) + 4.5), 4.0) or m.los(eye, (mx, my, m.ground(mx, my) + 4.5), 4.0):
+                    exposed = True
+                    break
+            if exposed:
+                continue
+            sc = gain * 40 - d * 0.4
             if sc > bs:
                 bs, best = sc, (x, y)
         return best
@@ -1146,12 +1193,17 @@ class Bot:
         base = {"laser": 3.0, "mortar": 2.5, "lightning": 2.0}.get(k, 0.0)
         if base <= 0:
             return 0.0
-        lists = [v[3] for v in self.enemy_info.values() if t - v[0] < 120]
+        me = getattr(self, "_me", None)
+        lists = []
+        for v in self.enemy_info.values():
+            if t - v[0] < 120:
+                w = 1.0 / (1.0 + dist2(me, (v[1], v[2])) / 150.0) if me is not None else 1.0
+                lists.append((w, v[3]))
         if not lists:
             return base
-        n = float(len(lists))
-        good = sum(1 for wl in lists if self.BEATS[k] in wl) / n
-        bad = sum(1 for wl in lists if any(self.BEATS.get(x) == k for x in wl)) / n
+        n = sum(w for w, _ in lists)
+        good = sum(w for w, wl in lists if self.BEATS[k] in wl) / n
+        bad = sum(w for w, wl in lists if any(self.BEATS.get(x) == k for x in wl)) / n
         return base + 1.5 * good - 1.5 * bad
 
     def pick_relocate(self, pos, threats, zc, zr, t):
