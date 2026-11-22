@@ -405,6 +405,7 @@ class Bot:
         self._pp_prev = {}  # key -> (t, (x, y))  previous choice, for hysteresis
         self._zs = (-99.0, None)
         self._swap = {}  # pickup id -> slot to drop when taking it
+        self.commit_id, self.commit_until = None, -99.0
 
     # ------------------------------------------------------------------
     def act(self, o):
@@ -425,6 +426,7 @@ class Bot:
         hp_frac = hp / max_hp
 
         action = {"tick": o.get("tick")}
+        self.last_ratio = None
         self.shoot_obj = None
         self.shoot_kind = None
 
@@ -578,7 +580,25 @@ class Bot:
             their_frac = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
             outmatched = (n_threat >= 2 or (hp_frac < 0.4 and their_frac > hp_frac + 0.1)) and not endgame
             outgunned = "laser" in (target.get("weapons") or []) and not has_laser and d > 60 and not endgame
-            if outgunned:
+            ratio = self.matchup(hp, my_kinds, me.get("cubes", 0) or 0, target, vis_enemies)
+            self.last_ratio = ratio
+            tid = target.get("id")
+            attacked_by_it = recently_hit and self.last_hit_by == tid
+            committed = self.commit_id == tid and t < self.commit_until
+            withdraw = (not attacked_by_it and not committed and ratio < 1.2
+                        and d >= 45 and not endgame and zone_urgency < 2.0)
+            if not withdraw:
+                self.commit_id, self.commit_until = tid, t + 5.0
+            if withdraw:
+                # it hasn't started on us and we wouldn't clearly win: back off out of its sight
+                mode = "withdraw"
+                dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="withdraw")
+                if dest is not None and dist2(pos, dest) > 3:
+                    mvx, mvy = toward(dest)
+                    nav_dest = dest
+                    speed = 1.0
+                hold_fire = True
+            elif outgunned:
                 # a laser out-trades our gun at range: break line of sight, go arm up, come back
                 mode = "escape"
                 dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="escape")
@@ -707,6 +727,8 @@ class Bot:
                 nav_dest = (zc[0], zc[1])
                 speed = 1.0
                 boost = energy > 20
+            elif nr > 4 and threats3 and self.can_hold(pos, threats3, zc, zr, nc, nr, d_center, shrink_end, t):
+                mode = "hold"  # safe here; let them gather and fight inside the circle
             elif nr > 4:
                 # take good ground inside the next circle early, away from known enemies
                 spot = self.pick_zone_spot(pos, threats3, zc, zr, nc, nr, t)
@@ -752,7 +774,7 @@ class Bot:
             mvy += ry
             if speed < 0.38:
                 speed = 0.38
-        elif mode in ("fight", "retreat", "evade", "loot_fight", "escape", "push"):
+        elif mode in ("fight", "retreat", "evade", "loot_fight", "escape", "push", "withdraw"):
             mvx += rx * 0.5
             mvy += ry * 0.5
 
@@ -1053,6 +1075,53 @@ class Bot:
         return best
 
     BEATS = {"laser": "mortar", "mortar": "lightning", "lightning": "laser"}
+
+    def can_hold(self, pos, threats, zc, zr, nc, nr, d_center, shrink_end, t):
+        """Stay put: nobody we know of can see us, and the zone leaves time to walk in later."""
+        d_out = max(0.0, dist2(pos, nc) - nr * 0.8)
+        if not ((shrink_end - t) > d_out / 8.0 + 10.0 and d_center < zr - 30):
+            return False
+        m = self.map
+        gz = pos[2] + 4.5
+        for (tx, ty, dg) in threats[:3]:
+            if dist2(pos, (tx, ty)) < 230 and m.los((tx, ty, m.ground(tx, ty) + 8.0), (pos[0], pos[1], gz), 4.0):
+                return False
+        return True
+
+    def wpow(self, kinds, d, foe_kinds):
+        """Rough damage-per-second power of a loadout at distance d (best weapon + a bit of the second)."""
+        vals = []
+        for k in kinds or ["gun"]:
+            if k == "gun":
+                v = max(0.0, 1.0 - d / 400.0) if d < 230 else 0.0
+            elif k == "laser":
+                v = 1.3 if d < 280 else 0.0
+            elif k == "mortar":
+                v = 0.8 if 30 < d < 225 else (0.3 if d <= 30 else 0.0)
+            elif k == "lightning":
+                v = 1.6 if d < 45 else 0.0
+            else:
+                v = 0.0
+            if v and self.BEATS.get(k) in (foe_kinds or []):
+                v *= 1.3
+            vals.append(v)
+        vals.sort(reverse=True)
+        return (vals[0] if vals else 0.0) + 0.3 * (vals[1] if len(vals) > 1 else 0.0) + 0.05
+
+    def matchup(self, hp, my_kinds, my_cubes, target, enemies):
+        """> 1: we should win the trade; < 1: we die first. Lanchester-style hp x dps."""
+        d = target["_d"]
+        tk = target.get("weapons") or ["gun"]
+        ours = self.wpow(my_kinds, d, tk) * (1 + 0.04 * min(10, my_cubes))
+        their_hp = float(target.get("hp", 1400) or 1400)
+        their_dps = 0.0
+        for m in enemies:
+            if m is target or (m.get("_los") and m["_d"] < 230):
+                mk = m.get("weapons") or ["gun"]
+                their_dps += self.wpow(mk, m["_d"], my_kinds) * (1 + 0.04 * min(10, m.get("cubes", 0) or 0))
+                if m is not target:
+                    their_hp += 0.5 * float(m.get("hp", 1400) or 1400)
+        return (hp * ours) / max(1.0, their_hp * their_dps)
 
     def weapon_value(self, k, t):
         """Base worth of a weapon, adjusted by what the enemies we've seen carry (triangle)."""
