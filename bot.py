@@ -261,6 +261,7 @@ class Bot:
         self.cover_t = -99.0
         self.prev_t = 0.0
         self.recent_mech_seen = {}  # id -> t
+        self.zone_walking = False
 
     # ------------------------------------------------------------------
     def act(self, o):
@@ -347,7 +348,7 @@ class Bot:
         # safe spot: inside the next circle, toward us
         if nr > 15:
             dx, dy = norm2(pos[0] - nc[0], pos[1] - nc[1])
-            safe_r = nr * 0.55
+            safe_r = nr * 0.7
             safe = (nc[0] + dx * safe_r, nc[1] + dy * safe_r)
             in_next = dist2(pos, nc) < nr * 0.8
         else:
@@ -363,6 +364,8 @@ class Bot:
         mode = "idle"
 
         # zone pressure
+        silent_speed = self.step_speed * 0.92  # m/s, below the step-sound threshold
+        silent_frac = min(1.0, silent_speed / max(0.1, walk_speed))
         zone_vec = (0.0, 0.0)
         zone_urgency = 0.0
         if outside:
@@ -376,10 +379,12 @@ class Bot:
             need_speed = dist_need / avail
             if need_speed > walk_speed * 0.6:
                 zone_urgency = 1.5
-            elif need_speed > self.step_speed * 0.6:
+            elif need_speed > silent_speed * 0.85:
                 zone_urgency = 1.0
-            else:
-                zone_urgency = 0.4
+            elif need_speed > 2.7 or (self.zone_walking and need_speed > 1.8):
+                zone_urgency = 0.4  # walk silently
+            # else: plenty of time -> stay in cover (urgency 0)
+        self.zone_walking = 0 < zone_urgency
         # edge proximity of the current circle (moving circle)
         if not outside and d_center > zr - 25 and zone_urgency < 1.0:
             zone_vec = norm2(zc[0] - pos[0], zc[1] - pos[1])
@@ -482,7 +487,7 @@ class Bot:
                 elif zone_urgency >= 1.0:
                     speed = 1.0
                 else:
-                    speed = 0.38  # silent walk
+                    speed = silent_frac  # silent walk
             else:
                 mode = "hide"
                 ct = self.find_cover(pos, zc, zr, nc, nr, t)
@@ -491,7 +496,7 @@ class Bot:
                     d = math.hypot(lx, ly)
                     if d > 4:
                         mvx, mvy = norm2(lx, ly)
-                        speed = 0.38 if d < 60 else 0.7
+                        speed = silent_frac
         # repulsion: NPCs, supply drops, close enemies we're not fighting
         rx, ry = 0.0, 0.0
         for n_ in npcs:
@@ -514,8 +519,8 @@ class Bot:
         if mode in ("hide", "zone", "loot") and (rx or ry):
             mvx += rx
             mvy += ry
-            if speed < 0.38:
-                speed = 0.38
+            if speed < silent_frac:
+                speed = silent_frac
         elif mode in ("fight", "retreat", "evade", "hide_from"):
             mvx += rx * 0.5
             mvy += ry * 0.5
@@ -673,14 +678,20 @@ class Bot:
 
     def find_cover(self, pos, zc, zr, nc, nr, t):
         """Find a spot next to a building, inside the safe area. Cached ~2 s."""
+        d_nc = dist2(pos, nc)
+
+        def ok(p):
+            # inside the current zone, and in the next circle or not farther from it
+            return dist2(p, zc) < zr - 20 and (dist2(p, nc) < max(nr * 0.85, 10) or dist2(p, nc) <= d_nc + 5)
+
         if self.cover_target is not None and t - self.cover_t < 2.0:
             ct = self.cover_target
-            if dist2(ct, nc) < max(nr * 0.85, 10) and dist2(ct, zc) < zr - 20:
+            if ok(ct):
                 return ct
         m = self.map
         if not m.ok:
             return None
-        if m.near_wall(pos[0], pos[1], 7.0) and dist2(pos, nc) < max(nr * 0.85, 10):
+        if m.near_wall(pos[0], pos[1], 7.0) and ok(pos):
             self.cover_target = (pos[0], pos[1])
             self.cover_t = t
             return self.cover_target
@@ -693,7 +704,7 @@ class Bot:
                 y = pos[1] + r * math.sin(a)
                 if m.blocked(x, y):
                     continue
-                if dist2((x, y), nc) > max(nr * 0.85, 10) or dist2((x, y), zc) > zr - 20:
+                if not ok((x, y)):
                     continue
                 if m.near_wall(x, y, 6.0):
                     if r < bd:
