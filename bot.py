@@ -655,10 +655,17 @@ class Bot:
             if withdraw:
                 # it hasn't started on us and we wouldn't clearly win: back off out of its sight
                 mode = "withdraw"
-                dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="withdraw", tdirs=tdirs)
+                dest = None
+                if nr > 25:
+                    dest = self.pick_zone_spot(pos, threats3, zc, zr, nc, nr, t, tdirs=tdirs)
+                    if dest is not None and dist2(pos, dest) < 4:
+                        dest = None
+                if dest is None:
+                    dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="withdraw", tdirs=tdirs)
                 if dest is not None and dist2(pos, dest) > 3:
                     mvx, mvy = toward(dest)
                     nav_dest = dest
+                    nav_cover = True
                     speed = 1.0
                 hold_fire = True
             elif breakout:
@@ -1186,13 +1193,15 @@ class Bot:
             return None
         R = max(nr, 8.0)
         cands = []
-        if dist2(pos, nc) < R * 0.85:
-            cands.append((pos[0], pos[1], 8.0))
-        for rf in (0.45, 0.7, 0.85):
-            for k in range(16):
-                a = k * math.pi / 8 + rf
-                # the rim of the next circle is the safest place to wait (one side is the zone)
-                cands.append((nc[0] + R * rf * math.cos(a), nc[1] + R * rf * math.sin(a), 8.0 if rf >= 0.7 else 0.0))
+        dn = dist2(pos, nc)
+        if R * 0.6 <= dn < R * 0.9:
+            cands.append((pos[0], pos[1], 8.0))  # already on the rim band
+        # orbit: rim band of the next circle, within +-100 deg of where we are (never through the middle)
+        me_a = math.atan2(pos[1] - nc[1], pos[0] - nc[0])
+        for k in range(-8, 9):
+            a = me_a + k * (math.pi / 18) * 1.1
+            for rf in (0.72, 0.85):
+                cands.append((nc[0] + R * rf * math.cos(a), nc[1] + R * rf * math.sin(a), 0.0))
         if self._zs[1] is not None:
             cands.append((self._zs[1][0], self._zs[1][1], 12.0))
         best, bs = None, -1e18
@@ -1254,8 +1263,11 @@ class Bot:
 
     def can_hold(self, pos, threats, zc, zr, nc, nr, d_center, shrink_end, t):
         """Stay put: nobody we know of can see us, and the zone leaves time to walk in later."""
-        if dist2(pos, nc) > max(nr * 1.15, nr + 40.0):
+        dn = dist2(pos, nc)
+        if dn > max(nr * 1.15, nr + 40.0):
             return False  # far from where everyone must end up: move now, don't sit
+        if nr > 25 and dn < nr * 0.6:
+            return False  # in the middle, where everyone converges: go to the rim
         d_out = max(0.0, dist2(pos, nc) - nr * 0.8)
         if not ((shrink_end - t) > d_out / 8.0 + 10.0 and d_center < zr - 30):
             return False
