@@ -388,7 +388,38 @@ class Bot:
         threat_close = [m for m in vis_enemies if m["_d"] < 200]
         n_threat = len(threat_close)
 
+        # placement matters, not kills: only take fights we can't avoid
+        avoid_target = None
         if target is not None and target.get("kind") != "npc":
+            d = target["_d"]
+            is_att = recently_hit and target.get("id") == self.last_hit_by
+            engage = d < 60 or (is_att and d < 100 and hp_frac > 0.45 and n_threat <= 1)
+            if not engage:
+                avoid_target = target
+                target = None
+
+        if avoid_target is not None and zone_urgency < 1.5:
+            # break line of sight: move behind a building, then sit still
+            mode = "hide_from"
+            threats = [m for m in vis_enemies if m["_d"] < 200][:2]
+            seen = any(m["_los"] for m in threats)
+            if seen or recently_hit:
+                hp_ = self.find_hide(pos, [m["pos"] for m in threats], zc, zr, t)
+                if hp_ is not None:
+                    lx, ly = hp_[0] - pos[0], hp_[1] - pos[1]
+                    if math.hypot(lx, ly) > 2.5:
+                        mvx, mvy = norm2(lx, ly)
+                        speed = 1.0
+                        boost = recently_hit and energy > 35
+                else:
+                    ex, ey = norm2(avoid_target["pos"][0] - pos[0], avoid_target["pos"][1] - pos[1])
+                    mvx, mvy = -ex - ey * self.strafe_dir, -ey + ex * self.strafe_dir
+                    speed = 1.0
+            if zone_urgency >= 1.0:
+                mvx += zone_vec[0] * 1.5 * zone_urgency
+                mvy += zone_vec[1] * 1.5 * zone_urgency
+                speed = max(speed, 1.0)
+        elif target is not None and target.get("kind") != "npc":
             # combat movement
             mode = "fight"
             d = target["_d"]
@@ -485,7 +516,7 @@ class Bot:
             mvy += ry
             if speed < 0.38:
                 speed = 0.38
-        elif mode in ("fight", "retreat", "evade"):
+        elif mode in ("fight", "retreat", "evade", "hide_from"):
             mvx += rx * 0.5
             mvy += ry * 0.5
 
@@ -525,6 +556,10 @@ class Bot:
         aim_cmd = None
         if target is not None:
             aim_cmd, fire = self.combat(target, weapons, muzzle, me, aim, energy)
+        elif avoid_target is not None:
+            # face it (front armor) without firing / making noise
+            ap = avoid_target["pos"]
+            aim_cmd = [math.atan2(ap[1] - pos[1], ap[0] - pos[0]), 0.0]
         elif recently_hit and self.last_hit_bearing is not None:
             aim_cmd = [self.last_hit_bearing, 0.0]
         else:
@@ -600,6 +635,41 @@ class Bot:
             if s > best_s:
                 best_s, best = s, (cx, cy)
         return best if best else (dx, dy)
+
+    def find_hide(self, pos, threat_pos, zc, zr, t):
+        """Nearest walkable point that no threat can see. Cached 0.5 s."""
+        if getattr(self, "_hide_t", -99) > t - 0.5 and self._hide is not None:
+            return self._hide
+        m = self.map
+        self._hide_t = t
+        self._hide = None
+        if not m.ok or not threat_pos:
+            return None
+        best, bs = None, 1e9
+        for r in (8, 15, 24, 36):
+            for k in range(12):
+                a = k * math.pi / 6
+                x = pos[0] + r * math.cos(a)
+                y = pos[1] + r * math.sin(a)
+                if m.blocked(x, y) or dist2((x, y), zc) > zr - 10:
+                    continue
+                gz = m.ground(x, y) + 4.5
+                nvis = 0
+                closer = 0.0
+                for tp in threat_pos:
+                    if m.los((tp[0], tp[1], tp[2] + 8.0), (x, y, gz), 3.0):
+                        nvis += 1
+                    if dist2((x, y), tp) < dist2(pos, tp) - 5:
+                        closer += 1
+                s = nvis * 100 + closer * 20 + r
+                if s < bs:
+                    bs, best = s, (x, y)
+            if best is not None and bs < 100:
+                break
+        if best is not None and bs >= 100 * len(threat_pos):
+            best = None  # nowhere hides us from anyone
+        self._hide = best
+        return best
 
     def find_cover(self, pos, zc, zr, nc, nr, t):
         """Find a spot next to a building, inside the safe area. Cached ~2 s."""
