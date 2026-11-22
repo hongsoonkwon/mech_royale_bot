@@ -533,6 +533,8 @@ class Bot:
             if ev.get("type") == "took":
                 self.seen_pickups.pop(ev.get("id"), None)
         my_kinds = [w.get("kind") for w in weapons if w]
+        # gun only early on = the weakest mech on the map, the first hunter's pick: arm up first
+        arm_first = t < 120 and not any(k != "gun" for k in my_kinds)
         has_laser = "laser" in my_kinds
         threats3 = self.threat_list(pos, t)
         want = self.want_weapon(pos, my_kinds, weapons, zc, zr, t)
@@ -577,7 +579,9 @@ class Bot:
             px, py = -ey * self.strafe_dir, ex * self.strafe_dir
             their_frac = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
             outmatched = (n_threat >= 2 or (hp_frac < 0.4 and their_frac > hp_frac + 0.1)) and not endgame
-            outgunned = "laser" in (target.get("weapons") or []) and not has_laser and d > 60 and not endgame
+            near_weapon = (arm_first and g is not None and g[0] == "pickup" and dist2(pos, g[2]) < 50)
+            outgunned = ("laser" in (target.get("weapons") or []) and not has_laser and d > 60
+                         and not endgame and not near_weapon)
             if outgunned:
                 # a laser out-trades our gun at range: break line of sight, go arm up, come back
                 mode = "escape"
@@ -587,7 +591,7 @@ class Bot:
                 speed = 1.0
                 boost = energy > 30
                 hold_fire = d > 150
-            elif goal_lock:
+            elif goal_lock or near_weapon:
                 mode = "loot_fight"
                 mvx, mvy = toward(g[2], 0.3)
                 nav_dest = g[2]
@@ -672,7 +676,8 @@ class Bot:
         if mode == "idle" and not fighting and not evading:
             # loot / position
             loot = None
-            if not vis_enemies or min(m["_d"] for m in vis_enemies) > 140 or goal_lock:
+            if (not vis_enemies or min(m["_d"] for m in vis_enemies) > 140 or goal_lock
+                    or (arm_first and min(m["_d"] for m in vis_enemies) > 70)):
                 loot = self.pick_loot(o, pos, weapons, zc, zr, t, hp_frac, npcs)
             if loot is not None:
                 if g is None or g[1] != loot[1].get("id"):
@@ -762,6 +767,23 @@ class Bot:
             nd = self.navigate(pos, nav_dest, t)
             if nd is not None:
                 mvx, mvy = nd
+
+        if "take" not in action:
+            have = [w.get("kind") for w in weapons if w]
+            free = any(w is None for w in weapons[:2]) if len(weapons) >= 2 else len(weapons) < 2
+            for pk in o.get("pickups", []) or []:
+                k = pk.get("kind")
+                if k in have or k not in ("laser", "mortar", "lightning"):
+                    continue
+                if dist2(pos, pk["pos"]) < 3.8 and abs(pk["pos"][2] - pos[2]) < 4:
+                    if free:
+                        action["take"] = pk["id"]
+                        break
+                    sw = self._swap.get(pk["id"]) if hasattr(self, "_swap") else None
+                    if sw is not None:
+                        action["take"] = pk["id"]
+                        action["drop"] = sw
+                        break
 
         # ---- obstacle steering + stuck handling
         jump = False
@@ -1157,7 +1179,8 @@ class Bot:
                         continue  # not clearly better than what we'd drop
                     self._swap[p.get("id")] = drop_slot
                 d = dist2(pos, p["pos"])
-                if d > (150 if early else 80) or dist2(p["pos"], zc) > zr - 15:
+                unarmed_early = t < 120 and not specials
+                if d > (220 if unarmed_early else (150 if early else 80)) or dist2(p["pos"], zc) > zr - 15:
                     continue
                 if abs(p["pos"][2] - pos[2]) > 12:
                     continue
@@ -1173,6 +1196,19 @@ class Bot:
             s = 30 - d
             if s > bscore:
                 bscore, best = s, ("cube", c)
+        if t < 120 and not specials:
+            # unarmed early: a weapon (seen now, or remembered) before any cube, crate or drone
+            if best is not None and best[0] == "pickup":
+                return best
+            rb, rd = None, 1e9
+            for i, (pt, k, x, y) in self.seen_pickups.items():
+                if t - pt > 240 or k in kinds or k not in ("laser", "mortar", "lightning"):
+                    continue
+                d = dist2(pos, (x, y)) - (40.0 if k == "laser" else 0.0)
+                if d < rd and dist2(pos, (x, y)) < 220 and dist2((x, y), zc) < zr - 15:
+                    rd, rb = d, ("pickup", {"id": i, "kind": k, "pos": [x, y, pos[2]]})
+            if rb is not None:
+                return rb
         if hp_frac > 0.6:
             # crates: 1 cube + maybe a weapon
             for c in o.get("crates", []) or []:
