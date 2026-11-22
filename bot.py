@@ -260,6 +260,11 @@ class Bot:
         self.cover_t = -99.0
         self.prev_t = 0.0
         self.recent_mech_seen = {}  # id -> t
+        self.goal = None  # (kind, id, [x, y], t_set)
+        self.enemy_pos = {}  # id -> (t, x, y)
+        self.last_combat_t = -99.0
+        self.reloc_done = True
+        self._rel, self._rel_t = None, -99.0
 
     # ------------------------------------------------------------------
     def act(self, o):
@@ -363,46 +368,71 @@ class Bot:
         boost = False
         mode = "idle"
 
-        # zone pressure
+        # zone: ride the (moving) edge instead of walking into the middle, where
+        # everyone else meets. zone_now() already looks a few seconds ahead.
         zone_vec = (0.0, 0.0)
         zone_urgency = 0.0
         if outside:
             zone_vec = norm2(zc[0] - pos[0], zc[1] - pos[1])
             zone_urgency = 2.0
-        elif not in_next:
-            zone_vec = norm2(safe[0] - pos[0], safe[1] - pos[1])
-            dist_need = dist2(pos, safe)
-            deadline = (shrink_start + shrink_end) * 0.5 if t < shrink_start else shrink_end
-            avail = max(1.0, deadline - t)
-            need_speed = dist_need / avail
-            if need_speed > walk_speed * 0.6:
-                zone_urgency = 1.5
-            elif need_speed > self.step_speed * 0.6:
-                zone_urgency = 1.0
-            else:
-                zone_urgency = 0.4
-        # edge proximity of the current circle (moving circle)
-        if not outside and d_center > zr - 25 and zone_urgency < 1.0:
+        elif d_center > zr - 14:
             zone_vec = norm2(zc[0] - pos[0], zc[1] - pos[1])
             zone_urgency = 1.0
 
         threat_close = [m for m in vis_enemies if m["_d"] < 200]
         n_threat = len(threat_close)
+        for m in vis_enemies:
+            self.enemy_pos[m.get("id")] = (t, m["pos"][0], m["pos"][1])
+        recent_threats = [(x, y) for (et, x, y) in self.enemy_pos.values() if t - et < 15]
+        if t > self.strafe_switch:
+            self.strafe_dir = -self.strafe_dir
+            self.strafe_switch = t + random.uniform(1.5, 3.0)
 
-        if target is not None and target.get("kind") != "npc":
-            # combat movement
+        # ---- loot goal memory: keep a target even when we look away from it
+        g = self.goal
+        if g is not None:
+            gk, gid, gp, gt = g
+            seen = (o.get("pickups") or []) + (o.get("crates") or []) + npcs
+            ids = set()
+            for x in seen:
+                ids.add(x.get("id"))
+                if x.get("id") == gid:
+                    gp[0], gp[1] = x["pos"][0], x["pos"][1]
+            gd = dist2(pos, gp)
+            gone = gid not in ids and gd < (12 if gk == "pickup" else 40)
+            took = any(ev.get("type") == "took" for ev in o.get("events", []) or [])
+            if t - gt > 25 or gone or took or dist2(gp, zc) > zr - 10:
+                self.goal = g = None
+        # accept some damage to finish a worthwhile errand when nobody is close
+        goal_lock = (g is not None and hp_frac > 0.5 and zone_urgency < 1.5
+                     and all(m["_d"] > 60 for m in vis_enemies))
+
+        def toward(p, strafe=0.0):
+            ux, uy = norm2(p[0] - pos[0], p[1] - pos[1])
+            return ux - uy * self.strafe_dir * strafe, uy + ux * self.strafe_dir * strafe
+
+        fighting = target is not None and target.get("kind") != "npc"
+        evading = (not fighting) and recently_hit and self.last_hit_bearing is not None
+        if fighting:
+            # combat: torso shoots, legs go somewhere useful
             mode = "fight"
+            self.last_combat_t, self.reloc_done = t, False
             d = target["_d"]
             ex, ey = norm2(target["pos"][0] - pos[0], target["pos"][1] - pos[1])
             px, py = -ey * self.strafe_dir, ex * self.strafe_dir
-            if t > self.strafe_switch:
-                self.strafe_dir = -self.strafe_dir
-                self.strafe_switch = t + random.uniform(0.8, 2.0)
             their_frac = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
             outmatched = n_threat >= 2 or (hp_frac < 0.4 and their_frac > hp_frac + 0.1)
-            if outmatched:
+            if goal_lock:
+                mode = "loot_fight"
+                mvx, mvy = toward(g[2], 0.3)
+                speed = 1.0
+            elif outmatched:
                 mode = "retreat"
-                mvx, mvy = -ex * 1.0 + px * 0.5, -ey * 1.0 + py * 0.5
+                dest = self.pick_relocate(pos, recent_threats, zc, zr, t)
+                if dest is not None:
+                    mvx, mvy = toward(dest, 0.3)
+                else:
+                    mvx, mvy = -ex + px * 0.5, -ey + py * 0.5
                 speed = 1.0
                 boost = energy > 30 and hp_frac < 0.5
             else:
@@ -416,23 +446,49 @@ class Bot:
             if zone_urgency >= 1.0:
                 mvx += zone_vec[0] * 1.5 * zone_urgency
                 mvy += zone_vec[1] * 1.5 * zone_urgency
-        elif recently_hit and self.last_hit_bearing is not None:
-            # hit by something we can't see/shoot: get out of its line
-            mode = "evade"
+        elif evading:
+            # hit by something we can't see/shoot: keep the errand, or break off to cover
+            self.last_combat_t, self.reloc_done = t, False
             b = self.last_hit_bearing
             ex, ey = math.cos(b), math.sin(b)
-            px, py = -ey * self.strafe_dir, ex * self.strafe_dir
-            mvx, mvy = -ex * 0.8 + px, -ey * 0.8 + py
+            if goal_lock:
+                mode = "loot_fight"
+                mvx, mvy = toward(g[2], 0.3)
+            else:
+                mode = "evade"
+                th = recent_threats or [(pos[0] + ex * 80, pos[1] + ey * 80)]
+                dest = self.pick_relocate(pos, th, zc, zr, t)
+                if dest is not None:
+                    mvx, mvy = toward(dest, 0.4)
+                else:
+                    mvx, mvy = -ex * 0.8 - ey * self.strafe_dir, -ey * 0.8 + ex * self.strafe_dir
             speed = 1.0
             boost = energy > 40 and hp_frac < 0.6
             if zone_urgency >= 1.0:
                 mvx += zone_vec[0] * 1.5 * zone_urgency
                 mvy += zone_vec[1] * 1.5 * zone_urgency
-        else:
+        elif t - self.last_combat_t < 12 and not self.reloc_done and zone_urgency < 1.5:
+            # after a fight: get away from whoever is left, then heal / loot
+            th = list(recent_threats)
+            if not th and self.last_hit_bearing is not None:
+                th = [(pos[0] + 80 * math.cos(self.last_hit_bearing), pos[1] + 80 * math.sin(self.last_hit_bearing))]
+            dest = self.pick_relocate(pos, th, zc, zr, t) if th else None
+            if dest is not None and dist2(pos, dest) > 4:
+                mode = "relocate"
+                mvx, mvy = toward(dest)
+                speed = 1.0
+            else:
+                self.reloc_done = True
+        if mode == "idle" and not fighting and not evading:
             # loot / position
             loot = None
-            if not vis_enemies or min(m["_d"] for m in vis_enemies) > 140:
+            if not vis_enemies or min(m["_d"] for m in vis_enemies) > 140 or goal_lock:
                 loot = self.pick_loot(o, pos, weapons, zc, zr, t, hp_frac, npcs)
+            if loot is not None:
+                if g is None or g[1] != loot[1].get("id"):
+                    self.goal = g = (loot[0], loot[1].get("id"), [loot[1]["pos"][0], loot[1]["pos"][1]], t)
+            elif g is not None:
+                loot = (g[0], {"id": g[1], "pos": [g[2][0], g[2][1], pos[2]]})
             if loot is not None and zone_urgency < 1.5:
                 mode = "loot"
                 kind, obj = loot
@@ -455,14 +511,8 @@ class Bot:
             elif zone_urgency > 0:
                 mode = "zone"
                 mvx, mvy = zone_vec
-                if zone_urgency >= 2.0:
-                    speed, boost = 1.0, energy > 20
-                elif zone_urgency >= 1.5:
-                    speed = 1.0
-                elif zone_urgency >= 1.0:
-                    speed = 1.0
-                else:
-                    speed = 0.38  # silent walk
+                speed = 1.0
+                boost = zone_urgency >= 2.0 and energy > 20
             else:
                 mode = "hide"
                 ct = self.find_cover(pos, zc, zr, nc, nr, t)
@@ -471,7 +521,7 @@ class Bot:
                     d = math.hypot(lx, ly)
                     if d > 4:
                         mvx, mvy = norm2(lx, ly)
-                        speed = 0.38 if d < 60 else 0.7
+                        speed = 1.0
         # repulsion: NPCs, supply drops, close enemies we're not fighting
         rx, ry = 0.0, 0.0
         for n_ in npcs:
@@ -493,12 +543,12 @@ class Bot:
                 w = (60 - d) / 60
                 rx += ux * w
                 ry += uy * w
-        if mode in ("hide", "zone", "loot") and (rx or ry):
+        if mode in ("hide", "zone", "loot", "relocate") and (rx or ry):
             mvx += rx
             mvy += ry
             if speed < 0.38:
                 speed = 0.38
-        elif mode in ("fight", "retreat", "evade"):
+        elif mode in ("fight", "retreat", "evade", "loot_fight"):
             mvx += rx * 0.5
             mvy += ry * 0.5
 
@@ -596,7 +646,7 @@ class Bot:
             return nc, nr
         f = (t - s0) / max(1e-6, (s1 - s0))
         # look a bit ahead so we keep a margin
-        f = min(1.0, f + 3.0 / max(1e-6, (s1 - s0)))
+        f = min(1.0, f + 4.0 / max(1e-6, (s1 - s0)))
         return [c[0] + (nc[0] - c[0]) * f, c[1] + (nc[1] - c[1]) * f], r + (nr - r) * f
 
     def steer(self, pos, dx, dy):
@@ -621,16 +671,51 @@ class Bot:
                 best_s, best = s, (cx, cy)
         return best if best else (dx, dy)
 
+    def pick_relocate(self, pos, threats, zc, zr, t):
+        """Cover-ish spot 35-80 m away, far from known threats and out of their sight. Cached 1.5 s."""
+        if self._rel is not None and t - self._rel_t < 1.5:
+            return self._rel
+        m = self.map
+        if not m.ok:
+            return None
+        near_t = min(threats, key=lambda p: dist2(pos, p)) if threats else None
+        best, bs = None, -1e9
+        for r in (35, 55, 80):
+            for k in range(12):
+                a = k * math.pi / 6
+                x = pos[0] + r * math.cos(a)
+                y = pos[1] + r * math.sin(a)
+                if m.blocked(x, y) or dist2((x, y), zc) > zr - 18:
+                    continue
+                dmin = min(dist2((x, y), p) for p in threats) if threats else 100.0
+                s = dmin - 0.3 * r
+                if m.near_wall(x, y, 6.0):
+                    s += 25
+                if near_t is not None:
+                    gz = m.ground(x, y)
+                    if not m.los((near_t[0], near_t[1], m.ground(near_t[0], near_t[1]) + 8.0), (x, y, gz + 4.5), 3.0):
+                        s += 35
+                if s > bs:
+                    bs, best = s, (x, y)
+        self._rel, self._rel_t = best, t
+        return best
+
     def find_cover(self, pos, zc, zr, nc, nr, t):
         """Find a spot next to a building, inside the safe area. Cached ~2 s."""
+        d_nc = dist2(pos, nc)
+
+        def ok(p):
+            # inside the current zone, and not drifting away from the next circle
+            return dist2(p, zc) < zr - 18 and (dist2(p, nc) < max(nr, 10) or dist2(p, nc) <= d_nc + 5)
+
         if self.cover_target is not None and t - self.cover_t < 2.0:
             ct = self.cover_target
-            if dist2(ct, nc) < max(nr * 0.85, 10) and dist2(ct, zc) < zr - 20:
+            if ok(ct):
                 return ct
         m = self.map
         if not m.ok:
             return None
-        if m.near_wall(pos[0], pos[1], 7.0) and dist2(pos, nc) < max(nr * 0.85, 10):
+        if m.near_wall(pos[0], pos[1], 7.0) and ok(pos):
             self.cover_target = (pos[0], pos[1])
             self.cover_t = t
             return self.cover_target
@@ -643,7 +728,7 @@ class Bot:
                 y = pos[1] + r * math.sin(a)
                 if m.blocked(x, y):
                     continue
-                if dist2((x, y), nc) > max(nr * 0.85, 10) or dist2((x, y), zc) > zr - 20:
+                if not ok((x, y)):
                     continue
                 if m.near_wall(x, y, 6.0):
                     if r < bd:
