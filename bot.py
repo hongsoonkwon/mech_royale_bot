@@ -824,6 +824,23 @@ class Bot:
             if nd is not None:
                 mvx, mvy = nd
 
+        if "take" not in action:
+            have = [w.get("kind") for w in weapons if w]
+            free = any(w is None for w in weapons[:2]) if len(weapons) >= 2 else len(weapons) < 2
+            for pk in o.get("pickups", []) or []:
+                k = pk.get("kind")
+                if k in have or k not in ("laser", "mortar", "lightning"):
+                    continue
+                if dist2(pos, pk["pos"]) < 3.8 and abs(pk["pos"][2] - pos[2]) < 4:
+                    if free:
+                        action["take"] = pk["id"]
+                        break
+                    sw = self._swap.get(pk["id"]) if hasattr(self, "_swap") else None
+                    if sw is not None:
+                        action["take"] = pk["id"]
+                        action["drop"] = sw
+                        break
+
         # ---- obstacle steering + stuck handling
         jump = False
         if (mvx or mvy) and speed > 0:
