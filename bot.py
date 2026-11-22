@@ -406,6 +406,7 @@ class Bot:
         self._zs = (-99.0, None)
         self._swap = {}  # pickup id -> slot to drop when taking it
         self.commit_id, self.commit_until = None, -99.0
+        self.heard = []  # (t, x, y, danger) estimated from sounds
 
     # ------------------------------------------------------------------
     def act(self, o):
@@ -531,6 +532,14 @@ class Bot:
                                             m.get("hp", 1400) / max(1, m.get("max_hp", 1400)))
         for pk in o.get("pickups", []) or []:
             self.seen_pickups[pk.get("id")] = (t, pk.get("kind"), pk["pos"][0], pk["pos"][1])
+        for snd in o.get("sounds", []) or []:
+            k, b = snd.get("kind"), snd.get("bearing")
+            dg = self.SOUND_DANGER.get(k)
+            if dg is None or b is None:
+                continue
+            r = {"near": 40.0, "mid": 110.0, "far": 220.0}.get(snd.get("dist"), 110.0)
+            self.heard.append((t, pos[0] + r * math.cos(b), pos[1] + r * math.sin(b), dg))
+        self.heard = [h for h in self.heard if t - h[0] < 10.0][-30:]
         for ev in o.get("events", []) or []:
             if ev.get("type") == "took":
                 self.seen_pickups.pop(ev.get("id"), None)
@@ -586,7 +595,7 @@ class Bot:
             attacked_by_it = recently_hit and self.last_hit_by == tid
             committed = self.commit_id == tid and t < self.commit_until
             withdraw = (not attacked_by_it and not committed and ratio < 1.2
-                        and d >= 45 and not endgame and zone_urgency < 2.0)
+                        and d >= 25 and not endgame and zone_urgency < 2.0)
             if not withdraw:
                 self.commit_id, self.commit_until = tid, t + 5.0
             if withdraw:
@@ -930,6 +939,8 @@ class Bot:
         return norm2(wp[0] - pos[0], wp[1] - pos[1])
 
     DANGER = {"laser": 2.0, "mortar": 1.5, "lightning": 1.2}
+    SOUND_DANGER = {"gun": 1.0, "laser": 2.0, "laser_charge": 2.0, "mortar": 1.5, "explosion": 1.0,
+                    "lightning": 1.2, "step": 1.0, "boost": 1.0, "jet": 1.0, "reload": 1.0}
 
     def threat_list(self, pos, t):
         """Up to 3 known enemies (seen in the last 15 s) as (x, y, danger), most dangerous first."""
@@ -940,6 +951,13 @@ class Bot:
             dg = max([1.0] + [self.DANGER.get(k, 1.0) for k in wl]) * (0.6 + 0.4 * hpf)
             d = dist2(pos, (x, y))
             out.append((dg * 200.0 / max(40.0, d), (x, y, dg)))
+        seen = [v[1] for v in out]
+        for (ht, x, y, dg) in self.heard:
+            if any(dist2((x, y), (sx, sy)) < 40 for (sx, sy, _) in seen):
+                continue  # already tracked by sight
+            d = dist2(pos, (x, y))
+            out.append((0.7 * dg * 200.0 / max(40.0, d), (x, y, 0.7 * dg)))
+            seen.append((x, y, dg))
         out.sort(key=lambda v: -v[0])
         return [v[1] for v in out[:5]]
 
