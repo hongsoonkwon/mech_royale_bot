@@ -614,7 +614,7 @@ class Bot:
             gd = dist2(pos, gp)
             gone = gid not in ids and gd < (12 if gk == "pickup" else 40)
             took = any(ev.get("type") == "took" for ev in o.get("events", []) or [])
-            if t - gt > 25 or gone or took or dist2(gp, zc) > zr - 10:
+            if t - gt > 25 or gone or took or dist2(gp, zc) > zr - 10 or (dist2(pos, gp) > 15 and self.danger_near(gp, t)):
                 self.goal = g = None
         # accept some damage to finish a worthwhile errand when nobody is close
         goal_lock = (g is not None and hp_frac > 0.5 and zone_urgency < 1.5
@@ -750,6 +750,15 @@ class Bot:
                 speed = 1.0
             else:
                 self.reloc_done = True
+        recovering = (hp_frac < 0.7 and t - self.last_combat_t < 40 and zone_urgency < 1.0 and not endgame)
+        if mode == "idle" and not fighting and not evading and recovering:
+            mode = "recover"
+            ct = self.pick_position(pos, threats3, zc, zr, nc, nr, t, key="recover", tdirs=tdirs)
+            if ct is not None and dist2(pos, ct) > 4:
+                mvx, mvy = toward(ct)
+                nav_dest = ct
+                nav_cover = True
+                speed = 1.0
         if mode == "idle" and not fighting and not evading and zone_urgency < 1.5:
             prey = self.pick_prey(pos, t, hp_frac, has_laser, my_kinds)
             if prey is not None:
@@ -850,7 +859,7 @@ class Bot:
                 w = (60 - d) / 60
                 rx += ux * w
                 ry += uy * w
-        if mode in ("hide", "zone", "loot", "relocate", "hunt", "position", "arm") and (rx or ry):
+        if mode in ("hide", "zone", "loot", "relocate", "hunt", "position", "arm", "recover") and (rx or ry):
             mvx += rx
             mvy += ry
             if speed < 0.38:
@@ -1075,7 +1084,7 @@ class Bot:
         m = self.map
         best, bs = None, -1e9
         for i, (pt, k, x, y) in self.seen_pickups.items():
-            if t - pt > 240 or k in my_kinds:
+            if t - pt > 240 or k in my_kinds or self.danger_near((x, y), t):
                 continue
             v = self.weapon_value(k, t)
             gain = v - (cur_val if full else 0.0)
@@ -1216,6 +1225,16 @@ class Bot:
         return best
 
     BEATS = {"laser": "mortar", "mortar": "lightning", "lightning": "laser"}
+
+    def danger_near(self, pt, t):
+        """An enemy was seen within 90 m of pt in the last 30 s, or heard within 70 m in the last 10 s."""
+        for (et, x, y, wl, hpf) in self.enemy_info.values():
+            if t - et < 30 and dist2(pt, (x, y)) < 90:
+                return True
+        for (ht, x, y, dg) in self.heard:
+            if t - ht < 10 and dist2(pt, (x, y)) < 70:
+                return True
+        return False
 
     def threat_dirs(self, pos, t):
         """Known (seen <= 20 s) and heard enemies within 300 m as (bearing, distance, danger)."""
@@ -1402,7 +1421,7 @@ class Bot:
             for p in o.get("pickups", []) or []:
                 k = p.get("kind")
                 v = self.weapon_value(k, t)
-                if k in kinds or v <= 0:
+                if k in kinds or v <= 0 or self.danger_near(p["pos"], t):
                     continue
                 if not empty:
                     if drop_slot is None or v < cur_val + 0.8:
@@ -1418,7 +1437,7 @@ class Bot:
                     bscore, best = s, ("pickup", p)
         for c in o.get("cubes", []) or []:
             d = dist2(pos, c["pos"])
-            if d > 45 or abs(c["pos"][2] - pos[2]) > 10:
+            if d > 45 or abs(c["pos"][2] - pos[2]) > 10 or (d > 12 and self.danger_near(c["pos"], t)):
                 continue
             if dist2(c["pos"], zc) > zr - 15:
                 continue
@@ -1429,7 +1448,7 @@ class Bot:
             # crates: 1 cube + maybe a weapon
             for c in o.get("crates", []) or []:
                 d = dist2(pos, c["pos"])
-                if d > 90 or abs(c["pos"][2] - pos[2]) > 4 or dist2(c["pos"], zc) > zr - 15:
+                if d > 90 or abs(c["pos"][2] - pos[2]) > 4 or dist2(c["pos"], zc) > zr - 15 or self.danger_near(c["pos"], t):
                     continue
                 s = 25 - d * 0.5
                 if s > bscore:
@@ -1438,7 +1457,7 @@ class Bot:
             if early:
                 for n_ in npcs:
                     d = dist2(pos, n_["pos"])
-                    if d > 90 or dist2(n_["pos"], zc) > zr - 15:
+                    if d > 90 or dist2(n_["pos"], zc) > zr - 15 or self.danger_near(n_["pos"], t):
                         continue
                     s = 22 - d * 0.5
                     if s > bscore:
