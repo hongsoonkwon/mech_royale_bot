@@ -163,7 +163,8 @@ class WorldMap:
                         blk[c] = 1
             self.block = blk
             self.ok = True
-            log("map loaded", self.gnx, self.gny)
+            log("map loaded", self.gnx, self.gny, "block", sum(blk),
+                "bldg", sum(1 for v in self.top if v > -1e8))
         except Exception as e:
             log("map load failed", repr(e))
             self.ok = False
