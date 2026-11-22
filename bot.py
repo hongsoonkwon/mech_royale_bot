@@ -163,8 +163,7 @@ class WorldMap:
                         blk[c] = 1
             self.block = blk
             self.ok = True
-            log("map loaded", self.gnx, self.gny, "block", sum(blk),
-                "bldg", sum(1 for v in self.top if v > -1e8))
+            log("map loaded", self.gnx, self.gny)
         except Exception as e:
             log("map load failed", repr(e))
             self.ok = False
@@ -261,8 +260,6 @@ class Bot:
         self.cover_t = -99.0
         self.prev_t = 0.0
         self.recent_mech_seen = {}  # id -> t
-        self.zone_walking = False
-        self.next_jump = 0.0
 
     # ------------------------------------------------------------------
     def act(self, o):
@@ -283,6 +280,8 @@ class Bot:
         hp_frac = hp / max_hp
 
         action = {"tick": o.get("tick")}
+        self.shoot_obj = None
+        self.shoot_kind = None
 
         # ---- events
         for ev in o.get("events", []) or []:
@@ -349,7 +348,7 @@ class Bot:
         # safe spot: inside the next circle, toward us
         if nr > 15:
             dx, dy = norm2(pos[0] - nc[0], pos[1] - nc[1])
-            safe_r = nr * 0.7
+            safe_r = nr * 0.55
             safe = (nc[0] + dx * safe_r, nc[1] + dy * safe_r)
             in_next = dist2(pos, nc) < nr * 0.8
         else:
@@ -365,8 +364,6 @@ class Bot:
         mode = "idle"
 
         # zone pressure
-        silent_speed = self.step_speed * 0.92  # m/s, below the step-sound threshold
-        silent_frac = min(1.0, silent_speed / max(0.1, walk_speed))
         zone_vec = (0.0, 0.0)
         zone_urgency = 0.0
         if outside:
@@ -380,12 +377,10 @@ class Bot:
             need_speed = dist_need / avail
             if need_speed > walk_speed * 0.6:
                 zone_urgency = 1.5
-            elif need_speed > silent_speed * 0.85:
+            elif need_speed > self.step_speed * 0.6:
                 zone_urgency = 1.0
-            elif need_speed > 2.7 or (self.zone_walking and need_speed > 1.8):
-                zone_urgency = 0.4  # walk silently
-            # else: plenty of time -> stay in cover (urgency 0)
-        self.zone_walking = 0 < zone_urgency
+            else:
+                zone_urgency = 0.4
         # edge proximity of the current circle (moving circle)
         if not outside and d_center > zr - 25 and zone_urgency < 1.0:
             zone_vec = norm2(zc[0] - pos[0], zc[1] - pos[1])
@@ -394,81 +389,50 @@ class Bot:
         threat_close = [m for m in vis_enemies if m["_d"] < 200]
         n_threat = len(threat_close)
 
-        # ---- state machine: fight / evade / alert / calm (placement > kills)
-        if t > self.strafe_switch:
-            self.strafe_dir = -self.strafe_dir
-            self.strafe_switch = t + random.uniform(0.5, 1.6)
-        jump_req = False
-        avoid_target = None
         if target is not None and target.get("kind") != "npc":
-            is_att = recently_hit and target.get("id") == self.last_hit_by
-            if not (is_att or target["_d"] < 45):
-                avoid_target = target  # not shooting at us: don't start it
-                target = None
-        if target is None and avoid_target is None:
-            near = [m for m in vis_enemies if m["_d"] < 160]
-            if near:
-                avoid_target = near[0]  # remembered / behind cover
-        threats = [m for m in vis_enemies if m["_d"] < 200][:2]
-        tpos = [m["pos"] for m in threats]
-
-        def toward_hide(tp_list):
-            hp_ = self.find_hide(pos, tp_list, zc, zr, t)
-            if hp_ is None:
-                return None
-            lx, ly = hp_[0] - pos[0], hp_[1] - pos[1]
-            if math.hypot(lx, ly) < 2.5:
-                return (0.0, 0.0)
-            return norm2(lx, ly)
-
-        if target is not None:
-            # FIGHT: return fire while strafing toward a LOS break, never closer
+            # combat movement
             mode = "fight"
-            tp = target["pos"]
-            ex, ey = norm2(tp[0] - pos[0], tp[1] - pos[1])
+            d = target["_d"]
+            ex, ey = norm2(target["pos"][0] - pos[0], target["pos"][1] - pos[1])
             px, py = -ey * self.strafe_dir, ex * self.strafe_dir
-            hv = None
-            if target.get("kind") != "npc" and tpos:
-                hv = toward_hide(tpos)
-            if hv is None:
-                hv = (-ex, -ey)
-            mvx, mvy = hv[0] + px * 0.8, hv[1] + py * 0.8
-            dot = mvx * ex + mvy * ey
-            if dot > 0:
-                mvx, mvy = mvx - dot * ex, mvy - dot * ey
-            speed = 1.0
-            boost = energy > 35 and hp_frac < 0.5
+            if t > self.strafe_switch:
+                self.strafe_dir = -self.strafe_dir
+                self.strafe_switch = t + random.uniform(0.8, 2.0)
+            their_frac = target.get("hp", 1400) / max(1, target.get("max_hp", 1400))
+            outmatched = n_threat >= 2 or (hp_frac < 0.4 and their_frac > hp_frac + 0.1)
+            if outmatched:
+                mode = "retreat"
+                mvx, mvy = -ex * 1.0 + px * 0.5, -ey * 1.0 + py * 0.5
+                speed = 1.0
+                boost = energy > 30 and hp_frac < 0.5
+            else:
+                back = 0.0
+                if d < 35:
+                    back = -0.8
+                elif d > 140:
+                    back = 0.3
+                mvx, mvy = px + ex * back, py + ey * back
+                speed = 1.0
+            if zone_urgency >= 1.0:
+                mvx += zone_vec[0] * 1.5 * zone_urgency
+                mvy += zone_vec[1] * 1.5 * zone_urgency
         elif recently_hit and self.last_hit_bearing is not None:
-            # EVADE: shot by something we can't see -> jink + jump, get behind cover
+            # hit by something we can't see/shoot: get out of its line
             mode = "evade"
             b = self.last_hit_bearing
             ex, ey = math.cos(b), math.sin(b)
             px, py = -ey * self.strafe_dir, ex * self.strafe_dir
-            fake = (pos[0] + ex * 80, pos[1] + ey * 80, pos[2])
-            hv = toward_hide(tpos or [fake])
-            if hv is None or hv == (0.0, 0.0):
-                hv = (-ex * 0.6, -ey * 0.6)
-            mvx, mvy = hv[0] + px, hv[1] + py
+            mvx, mvy = -ex * 0.8 + px, -ey * 0.8 + py
             speed = 1.0
-            if grounded and t > self.next_jump:
-                jump_req = True
-                self.next_jump = t + random.uniform(0.7, 1.8)
-        elif avoid_target is not None:
-            # ALERT: enemy around but not on us -> no shots, break LOS away from it
-            mode = "alert"
-            if any(m["_los"] for m in threats):
-                hv = toward_hide(tpos)
-                if hv is None:
-                    ex, ey = norm2(avoid_target["pos"][0] - pos[0], avoid_target["pos"][1] - pos[1])
-                    hv = (-ex - ey * self.strafe_dir * 0.5, -ey + ex * self.strafe_dir * 0.5)
-                mvx, mvy = hv
-                speed = 1.0
-            # already hidden: hold still (silent, regen)
+            boost = energy > 40 and hp_frac < 0.6
+            if zone_urgency >= 1.0:
+                mvx += zone_vec[0] * 1.5 * zone_urgency
+                mvy += zone_vec[1] * 1.5 * zone_urgency
         else:
             # loot / position
             loot = None
             if not vis_enemies or min(m["_d"] for m in vis_enemies) > 140:
-                loot = self.pick_loot(o, pos, weapons, zc, zr)
+                loot = self.pick_loot(o, pos, weapons, zc, zr, t, hp_frac, npcs)
             if loot is not None and zone_urgency < 1.5:
                 mode = "loot"
                 kind, obj = loot
@@ -476,6 +440,16 @@ class Bot:
                 mvx, mvy = norm2(lx, ly)
                 d = math.hypot(lx, ly)
                 speed = 1.0 if d > 6 else 0.5
+                if kind in ("crate", "npc"):
+                    # shoot it from mid range, then walk in for the drops
+                    op = obj["pos"]
+                    c = (op[0], op[1], op[2] + (0.8 if kind == "crate" else 1.75))
+                    if d < 70 and self.map.los(muzzle, c):
+                        self.shoot_obj = obj
+                        self.shoot_kind = kind
+                        if d < 30:
+                            mvx, mvy = -mvy * self.strafe_dir, mvx * self.strafe_dir
+                            speed = 0.6
                 if kind == "pickup" and d < 3.8 and abs(obj["pos"][2] - pos[2]) < 4:
                     action["take"] = obj["id"]
             elif zone_urgency > 0:
@@ -488,7 +462,7 @@ class Bot:
                 elif zone_urgency >= 1.0:
                     speed = 1.0
                 else:
-                    speed = silent_frac  # silent walk
+                    speed = 0.38  # silent walk
             else:
                 mode = "hide"
                 ct = self.find_cover(pos, zc, zr, nc, nr, t)
@@ -497,11 +471,13 @@ class Bot:
                     d = math.hypot(lx, ly)
                     if d > 4:
                         mvx, mvy = norm2(lx, ly)
-                        speed = silent_frac
+                        speed = 0.38 if d < 60 else 0.7
         # repulsion: NPCs, supply drops, close enemies we're not fighting
         rx, ry = 0.0, 0.0
         for n_ in npcs:
             d = dist2(pos, n_["pos"])
+            if self.shoot_obj is n_:
+                continue
             if d < 70:
                 ux, uy = norm2(pos[0] - n_["pos"][0], pos[1] - n_["pos"][1])
                 w = (70 - d) / 70 * 1.5
@@ -517,31 +493,17 @@ class Bot:
                 w = (60 - d) / 60
                 rx += ux * w
                 ry += uy * w
-        if mode in ("hide", "zone", "loot"):
-            # calm: keep away from enemies we still remember
-            for m in vis_enemies:
-                d = m["_d"]
-                if d < 250:
-                    ux, uy = norm2(pos[0] - m["pos"][0], pos[1] - m["pos"][1])
-                    w = (250 - d) / 250 * 2.0
-                    rx += ux * w
-                    ry += uy * w
-        elif zone_urgency >= 1.0:
-            # threat states still have to respect the zone
-            mvx += zone_vec[0] * 1.5 * zone_urgency
-            mvy += zone_vec[1] * 1.5 * zone_urgency
-            speed = max(speed, 1.0)
         if mode in ("hide", "zone", "loot") and (rx or ry):
             mvx += rx
             mvy += ry
-            if speed < silent_frac:
-                speed = silent_frac
-        elif mode in ("fight", "evade", "alert"):
+            if speed < 0.38:
+                speed = 0.38
+        elif mode in ("fight", "retreat", "evade"):
             mvx += rx * 0.5
             mvy += ry * 0.5
 
         # ---- obstacle steering + stuck handling
-        jump = jump_req
+        jump = False
         if (mvx or mvy) and speed > 0:
             dx, dy = norm2(mvx, mvy)
             dx, dy = self.steer(pos, dx, dy)
@@ -576,10 +538,13 @@ class Bot:
         aim_cmd = None
         if target is not None:
             aim_cmd, fire = self.combat(target, weapons, muzzle, me, aim, energy)
-        elif avoid_target is not None:
-            # face it (front armor) without firing / making noise
-            ap = avoid_target["pos"]
-            aim_cmd = [math.atan2(ap[1] - pos[1], ap[0] - pos[0]), 0.0]
+        elif self.shoot_obj is not None:
+            op = self.shoot_obj["pos"]
+            if self.shoot_kind == "crate":
+                fake = {"pos": [op[0], op[1], op[2] - 0.95], "vel": [0, 0, 0], "kind": "npc"}
+            else:
+                fake = self.shoot_obj
+            aim_cmd, fire = self.combat(fake, weapons, muzzle, me, aim, energy)
         elif recently_hit and self.last_hit_bearing is not None:
             aim_cmd = [self.last_hit_bearing, 0.0]
         else:
@@ -604,13 +569,12 @@ class Bot:
                 self.scan_yaw = wrap(self.scan_yaw + 0.12)
                 look = self.scan_yaw
             aim_cmd = [look, 0.0]
-        # reload whenever nobody has a line on us (no way to cancel it later)
-        if target is None and not any(m["_los"] for m in vis_enemies):
-            for w in weapons:
-                if w and w.get("kind") == "gun" and w.get("reload", 0) == 0:
-                    mag = float((w.get("stats") or {}).get("mag", 12))
-                    if w.get("ammo", mag) < mag * 0.75:
+            # keep gun loaded during quiet time
+            for i, w in enumerate(weapons):
+                if w and w.get("kind") == "gun" and w.get("ammo", 12) < 6 and w.get("reload", 0) == 0:
+                    if not vis_enemies:
                         action["reload"] = True
+            # release a charging laser if no target
         action["aim"] = [round(aim_cmd[0], 4), round(max(self.min_pitch, min(self.max_pitch, aim_cmd[1])), 4)]
         action["fire"] = fire
 
@@ -657,57 +621,16 @@ class Bot:
                 best_s, best = s, (cx, cy)
         return best if best else (dx, dy)
 
-    def find_hide(self, pos, threat_pos, zc, zr, t):
-        """Nearest walkable point that no threat can see. Cached 0.5 s."""
-        if getattr(self, "_hide_t", -99) > t - 0.5 and self._hide is not None:
-            return self._hide
-        m = self.map
-        self._hide_t = t
-        self._hide = None
-        if not m.ok or not threat_pos:
-            return None
-        best, bs = None, 1e9
-        for r in (8, 15, 24, 36):
-            for k in range(12):
-                a = k * math.pi / 6
-                x = pos[0] + r * math.cos(a)
-                y = pos[1] + r * math.sin(a)
-                if m.blocked(x, y) or dist2((x, y), zc) > zr - 10:
-                    continue
-                # never pick a spot that brings us closer to a threat
-                if any(dist2((x, y), tp) < dist2(pos, tp) - 3 for tp in threat_pos):
-                    continue
-                gz = m.ground(x, y) + 4.5
-                nvis = 0
-                for tp in threat_pos:
-                    if m.los((tp[0], tp[1], tp[2] + 8.0), (x, y, gz), 3.0):
-                        nvis += 1
-                s = nvis * 100 + r
-                if s < bs:
-                    bs, best = s, (x, y)
-            if best is not None and bs < 100:
-                break
-        if best is not None and bs >= 100 * len(threat_pos):
-            best = None  # nowhere hides us from anyone
-        self._hide = best
-        return best
-
     def find_cover(self, pos, zc, zr, nc, nr, t):
         """Find a spot next to a building, inside the safe area. Cached ~2 s."""
-        d_nc = dist2(pos, nc)
-
-        def ok(p):
-            # inside the current zone, and in the next circle or not farther from it
-            return dist2(p, zc) < zr - 20 and (dist2(p, nc) < max(nr * 0.85, 10) or dist2(p, nc) <= d_nc + 5)
-
         if self.cover_target is not None and t - self.cover_t < 2.0:
             ct = self.cover_target
-            if ok(ct):
+            if dist2(ct, nc) < max(nr * 0.85, 10) and dist2(ct, zc) < zr - 20:
                 return ct
         m = self.map
         if not m.ok:
             return None
-        if m.near_wall(pos[0], pos[1], 7.0) and ok(pos):
+        if m.near_wall(pos[0], pos[1], 7.0) and dist2(pos, nc) < max(nr * 0.85, 10):
             self.cover_target = (pos[0], pos[1])
             self.cover_t = t
             return self.cover_target
@@ -720,7 +643,7 @@ class Bot:
                 y = pos[1] + r * math.sin(a)
                 if m.blocked(x, y):
                     continue
-                if not ok((x, y)):
+                if dist2((x, y), nc) > max(nr * 0.85, 10) or dist2((x, y), zc) > zr - 20:
                     continue
                 if m.near_wall(x, y, 6.0):
                     if r < bd:
@@ -731,11 +654,13 @@ class Bot:
         self.cover_t = t
         return best
 
-    def pick_loot(self, o, pos, weapons, zc, zr):
+    def pick_loot(self, o, pos, weapons, zc, zr, t=999.0, hp_frac=1.0, npcs=()):
+        """Power up so we are not the weakest mech (house bots hunt the weakest first)."""
         kinds = [w.get("kind") for w in weapons if w]
         empty = any(w is None for w in weapons[:2]) if len(weapons) >= 2 else len(weapons) < 2
         best = None
         bscore = -1e9
+        early = t < 150
         pref = {"laser": 3.0, "mortar": 2.5, "lightning": 2.0, "gun": 0.0}
         if empty:
             for p in o.get("pickups", []) or []:
@@ -743,11 +668,11 @@ class Bot:
                 if k in kinds or pref.get(k, 0) <= 0:
                     continue
                 d = dist2(pos, p["pos"])
-                if d > 70 or dist2(p["pos"], zc) > zr - 15:
+                if d > (150 if early else 80) or dist2(p["pos"], zc) > zr - 15:
                     continue
                 if abs(p["pos"][2] - pos[2]) > 12:
                     continue
-                s = pref[k] * 20 - d
+                s = pref[k] * 30 - d * 0.5  # a weapon beats a crate
                 if s > bscore:
                     bscore, best = s, ("pickup", p)
         for c in o.get("cubes", []) or []:
@@ -759,6 +684,24 @@ class Bot:
             s = 30 - d
             if s > bscore:
                 bscore, best = s, ("cube", c)
+        if hp_frac > 0.6:
+            # crates: 1 cube + maybe a weapon
+            for c in o.get("crates", []) or []:
+                d = dist2(pos, c["pos"])
+                if d > 90 or abs(c["pos"][2] - pos[2]) > 4 or dist2(c["pos"], zc) > zr - 15:
+                    continue
+                s = 25 - d * 0.5
+                if s > bscore:
+                    bscore, best = s, ("crate", c)
+            # NPC drones: 2 cubes each, weak
+            if early:
+                for n_ in npcs:
+                    d = dist2(pos, n_["pos"])
+                    if d > 90 or dist2(n_["pos"], zc) > zr - 15:
+                        continue
+                    s = 22 - d * 0.5
+                    if s > bscore:
+                        bscore, best = s, ("npc", n_)
         return best
 
     def pick_upgrade(self, choices):
