@@ -185,6 +185,20 @@ class WorldMap:
                             cnt += 1
                     opn[oj * self.onx + oi] = cnt
             self.open = opn
+            # 4 m navigation grid: blocked if any 2 m cell in it is blocked
+            f = max(1, int(round(4.0 / res)))
+            self.nf = f
+            self.nres = res * f
+            self.nnx = self.gnx // f + 1
+            self.nny = self.gny // f + 1
+            nb = bytearray(self.nnx * self.nny)
+            for j in range(self.gny):
+                row = j * self.gnx
+                nrow = (j // f) * self.nnx
+                for i in range(self.gnx):
+                    if blk[row + i]:
+                        nb[nrow + i // f] = 1
+            self.nblock = nb
             self.ok = True
             log("map loaded", self.gnx, self.gny)
         except Exception as e:
@@ -251,6 +265,92 @@ class WorldMap:
             return 1.0
         return self.open[oj * self.onx + oi] / 12.0
 
+    def path_clear(self, a, b):
+        """Walkable straight line between a and b (2 m samples)."""
+        if not self.ok:
+            return True
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        n = int(math.hypot(dx, dy) / 2.0)
+        for k in range(1, n + 1):
+            f = k / max(1, n)
+            if self.blocked(a[0] + dx * f, a[1] + dy * f):
+                return False
+        return True
+
+    def find_path(self, a, b, max_nodes=2500):
+        """A* on the 4 m grid. Returns world waypoints (partial path toward b if not reached)."""
+        if not self.ok or getattr(self, "nblock", None) is None:
+            return None
+        R, nx, ny, nb = self.nres, self.nnx, self.nny, self.nblock
+
+        def cel(p):
+            return int((p[0] - self.gx0) / R), int((p[1] - self.gy0) / R)
+
+        sx, sy = cel(a)
+        gx, gy = cel(b)
+        if not (0 <= sx < nx and 0 <= sy < ny and 0 <= gx < nx and 0 <= gy < ny):
+            return None
+        if nb[gy * nx + gx]:
+            found = False
+            for rr in range(1, 5):
+                for ddx in range(-rr, rr + 1):
+                    for ddy in (-rr, rr) if abs(ddx) != rr else range(-rr, rr + 1):
+                        x2, y2 = gx + ddx, gy + ddy
+                        if 0 <= x2 < nx and 0 <= y2 < ny and not nb[y2 * nx + x2]:
+                            gx, gy, found = x2, y2, True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+        start, goal = sy * nx + sx, gy * nx + gx
+        import heapq
+        D2 = 1.4142
+
+        def h(c):
+            ddx, ddy = abs(c % nx - gx), abs(c // nx - gy)
+            return max(ddx, ddy) + 0.4142 * min(ddx, ddy)
+
+        openh = [(h(start), 0.0, start)]
+        gcost = {start: 0.0}
+        came = {}
+        best, besth = start, h(start)
+        nodes = 0
+        nbrs = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0), (1, 1, D2), (1, -1, D2), (-1, 1, D2), (-1, -1, D2))
+        while openh and nodes < max_nodes:
+            f_, gc, c = heapq.heappop(openh)
+            if gc > gcost.get(c, 1e18):
+                continue
+            nodes += 1
+            if c == goal:
+                best = c
+                break
+            hc = f_ - gc
+            if hc < besth:
+                besth, best = hc, c
+            cx, cy = c % nx, c // nx
+            for ddx, ddy, w in nbrs:
+                x2, y2 = cx + ddx, cy + ddy
+                if not (0 <= x2 < nx and 0 <= y2 < ny):
+                    continue
+                c2 = y2 * nx + x2
+                if nb[c2] and c2 != start:
+                    continue
+                if ddx and ddy and (nb[cy * nx + x2] or nb[y2 * nx + cx]):
+                    continue  # no corner cutting
+                g2 = gc + w
+                if g2 < gcost.get(c2, 1e18):
+                    gcost[c2] = g2
+                    came[c2] = c
+                    heapq.heappush(openh, (g2 + h(c2), g2, c2))
+        path = []
+        c = best
+        while c != start and c in came:
+            path.append((self.gx0 + (c % nx + 0.5) * R, self.gy0 + (c // nx + 0.5) * R))
+            c = came[c]
+        path.reverse()
+        return path
+
     def near_wall(self, x, y, r=8.0):
         if not self.ok:
             return False
@@ -301,6 +401,7 @@ class Bot:
         self.enemy_info = {}  # id -> (t, x, y, weapons, hp_frac)
         self.seen_pickups = {}  # id -> (t, kind, x, y)
         self._pp = (-99.0, None, None)
+        self._path, self._path_goal, self._path_t = None, None, -99.0
 
     # ------------------------------------------------------------------
     def act(self, o):
@@ -431,6 +532,7 @@ class Bot:
         threats3 = self.threat_list(pos, t)
         want = self.want_weapon(pos, my_kinds, weapons, zc, zr, t)
         hold_fire = False
+        nav_dest = None
         recent_threats = [(x, y) for (et, x, y) in self.enemy_pos.values() if t - et < 15]
         if t > self.strafe_switch:
             self.strafe_dir = -self.strafe_dir
@@ -476,16 +578,19 @@ class Bot:
                 mode = "escape"
                 dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="escape")
                 mvx, mvy = toward(dest, 0.2) if dest is not None else (-ex, -ey)
+                nav_dest = dest
                 speed = 1.0
                 boost = energy > 30
                 hold_fire = d > 150
             elif goal_lock:
                 mode = "loot_fight"
                 mvx, mvy = toward(g[2], 0.3)
+                nav_dest = g[2]
                 speed = 1.0
             elif outmatched:
                 mode = "retreat"
                 dest = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="retreat")
+                nav_dest = dest
                 if dest is not None:
                     mvx, mvy = toward(dest, 0.3)
                 else:
@@ -511,10 +616,12 @@ class Bot:
             if goal_lock:
                 mode = "loot_fight"
                 mvx, mvy = toward(g[2], 0.3)
+                nav_dest = g[2]
             else:
                 mode = "evade"
                 th = threats3 or [(pos[0] + ex * 80, pos[1] + ey * 80, 1.5)]
                 dest = self.pick_position(pos, th, zc, zr, nc, nr, t, want=want, key="evade")
+                nav_dest = dest
                 if dest is not None:
                     mvx, mvy = toward(dest, 0.4)
                 else:
@@ -533,6 +640,7 @@ class Bot:
             if dest is not None and dist2(pos, dest) > 4:
                 mode = "relocate"
                 mvx, mvy = toward(dest)
+                nav_dest = dest
                 speed = 1.0
             else:
                 self.reloc_done = True
@@ -544,6 +652,7 @@ class Bot:
                 dest = self.pick_position(pos, others, zc, zr, nc, nr, t, hunt=prey, key="hunt")
                 if dest is not None:
                     mvx, mvy = toward(dest)
+                    nav_dest = dest
                     speed = 1.0
         if mode == "idle" and not fighting and not evading:
             # loot / position
@@ -562,6 +671,7 @@ class Bot:
                 mvx, mvy = norm2(lx, ly)
                 d = math.hypot(lx, ly)
                 speed = 1.0 if d > 6 else 0.5
+                nav_dest = (obj["pos"][0], obj["pos"][1])
                 if kind in ("crate", "npc"):
                     # shoot it from mid range, then walk in for the drops
                     op = obj["pos"]
@@ -577,6 +687,7 @@ class Bot:
             elif zone_urgency > 0:
                 mode = "zone"
                 mvx, mvy = zone_vec
+                nav_dest = (zc[0], zc[1])
                 speed = 1.0
                 boost = zone_urgency >= 2.0 and energy > 20
             elif threats3:
@@ -585,6 +696,7 @@ class Bot:
                 ct = self.pick_position(pos, threats3, zc, zr, nc, nr, t, want=want, key="hide")
                 if ct is not None and dist2(pos, ct) > 4:
                     mvx, mvy = toward(ct)
+                    nav_dest = ct
                     speed = 1.0
             else:
                 mode = "hide"
@@ -594,6 +706,7 @@ class Bot:
                     d = math.hypot(lx, ly)
                     if d > 4:
                         mvx, mvy = norm2(lx, ly)
+                        nav_dest = ct
                         speed = 1.0
         # repulsion: NPCs, supply drops, close enemies we're not fighting
         rx, ry = 0.0, 0.0
@@ -624,6 +737,13 @@ class Bot:
         elif mode in ("fight", "retreat", "evade", "loot_fight", "escape"):
             mvx += rx * 0.5
             mvy += ry * 0.5
+
+        if zone_urgency >= 2.0:
+            nav_dest = (zc[0], zc[1])  # outside the zone: getting back in comes first
+        if nav_dest is not None and (mvx or mvy) and speed > 0:
+            nd = self.navigate(pos, nav_dest, t)
+            if nd is not None:
+                mvx, mvy = nd
 
         # ---- obstacle steering + stuck handling
         jump = False
@@ -745,6 +865,29 @@ class Bot:
             if s > best_s:
                 best_s, best = s, (cx, cy)
         return best if best else (dx, dy)
+
+    def navigate(self, pos, dest, t):
+        """Direction toward dest around buildings, or None when the straight line is walkable."""
+        m = self.map
+        if dest is None or not m.ok or m.path_clear(pos, dest):
+            self._path = None
+            return None
+        if (self._path is None or self._path_goal is None or dist2(self._path_goal, dest) > 10
+                or t - self._path_t > 3.0):
+            self._path = m.find_path(pos, dest) or []
+            self._path_goal, self._path_t = (dest[0], dest[1]), t
+        path = self._path
+        while path and dist2(pos, path[0]) < 4.0:
+            path.pop(0)
+        if not path:
+            return None
+        wp = path[0]
+        for q in path[1:12]:
+            if m.path_clear(pos, q):
+                wp = q
+            else:
+                break
+        return norm2(wp[0] - pos[0], wp[1] - pos[1])
 
     DANGER = {"laser": 2.0, "mortar": 1.5, "lightning": 1.2}
 
